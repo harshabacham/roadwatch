@@ -1,0 +1,6 @@
+{
+  "name": "RoadWatch",
+  "description": "Mobile-first road pothole detection and automated municipal complaint filing portal with live camera scanning and GPS geotagging.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
