@@ -626,11 +626,11 @@ export function analyzePixelsUnsupervised(
 
   const clusters: ClusterProfile[] = clusterStats.map((c, idx) => {
     let role = 'Surface Transition';
-    if (c.cid === roadClusterId) role = 'Dominant Asphalt Baseline';
-    else if (c.cid === anomalyClusterId) role = 'Cavity & Roughness Anomaly';
-    else if (c.meanL > 0.6) role = 'Bright Markings / Reflections';
+    if (c.cid === roadClusterId) role = 'Normal Road Surface';
+    else if (c.cid === anomalyClusterId) role = 'Damaged / Cavity Area';
+    else if (c.meanL > 0.6) role = 'Lane Lines / Glare';
     else if (c.meanRough > statGrad.med + statStd.med)
-      role = 'Cracked Rim / Aggregate';
+      role = 'Cracked Pavement Edges';
 
     const color =
       c.cid === roadClusterId
@@ -849,7 +849,7 @@ export function analyzePixelsUnsupervised(
     const roughnessScorePct = Math.round(meanRough * 100);
 
     detections.push({
-      label: `Cluster #${detections.length + 1} (Z=${meanZ.toFixed(1)}, ${clusterConfidence}%)`,
+      label: `Pothole #${detections.length + 1} (${clusterConfidence}% match)`,
       severity,
       estimatedWidthCm,
       estimatedDepthCm: depthResult.estimatedDepthCm,
@@ -861,9 +861,7 @@ export function analyzePixelsUnsupervised(
       mahalanobisZ: Number(meanZ.toFixed(2)),
       luminanceDropPct,
       roughnessScorePct,
-      hazardDescription: `DBSCAN cluster (${members.length} patches, Mahalanobis Z=${meanZ.toFixed(
-        2
-      )}), Shannon Entropy H=${depthResult.details.shannonEntropyBits} bits (${depthResult.details.entropyRatio}x baseline), Relative Scale=${depthResult.details.relativeScaleIndex}.`,
+      hazardDescription: `Roadway cavity approx. ${estimatedWidthCm} cm wide and ${depthResult.estimatedDepthCm} cm deep (${depthResult.details.confidenceRangeCm}), ${roughnessScorePct}% surface roughness, and ${depthResult.details.shadowOcclusionPct}% interior shadow depth.`,
       box,
     });
   }
@@ -993,20 +991,16 @@ export function analyzePixelsUnsupervised(
     : 0;
 
   const formalComplaintTitle = potholeDetected
-    ? `${overallSeverity} Roadway Pothole Detected (${topDetections.length} Cluster${
+    ? `${overallSeverity} Roadway Pothole Detected (${topDetections.length} Hazard${
         topDetections.length > 1 ? 's' : ''
       }, ~${maxWidth} cm)`
     : 'Clear Roadway Segment';
 
   const formalComplaintDescription = potholeDetected
-    ? `Unsupervised computer vision (K-Means++ K=${params.kClusters}, Mahalanobis anomaly Z>=${zThreshold.toFixed(
-        2
-      )}, DBSCAN spatial clustering) isolated ${topDetections.length} pavement failure cluster${
+    ? `Automated camera road inspection detected ${topDetections.length} pavement hazard${
         topDetections.length > 1 ? 's' : ''
-      } against the learned ${roadSurfaceType.toLowerCase()} baseline. Largest defect spans approx. ${maxWidth} cm wide by ${maxDepth} cm deep.`
-    : `No anomalous pavement depression clusters exceeded Mahalanobis threshold Z=${zThreshold.toFixed(
-        2
-      )}.`;
+      } on ${roadSurfaceType.toLowerCase()}. Largest pothole measures approx. ${maxWidth} cm wide by ${maxDepth} cm deep.`
+    : 'No significant roadway potholes or surface cavities detected in this segment.';
 
   const inferenceMs = Number((performance.now() - startTime).toFixed(1));
   const anomalousPatchCount = roadPatches.filter((p) => p.isAnomaly).length;

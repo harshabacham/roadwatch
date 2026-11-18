@@ -20,7 +20,7 @@ export default defineConfig(() => {
           id: '/',
           name: 'RoadWatch — Pothole Detection & Civic Complaints',
           short_name: 'RoadWatch',
-          description: 'Detect road potholes automatically from your mobile camera using unsupervised ML, queue filings offline in IndexedDB, and file geotagged complaints to government portals.',
+          description: 'Detect road potholes automatically from your mobile camera, estimate depth and size, queue filings offline, and submit geotagged complaints to government portals.',
           theme_color: '#0f172a',
           background_color: '#f8fafc',
           display: 'standalone',

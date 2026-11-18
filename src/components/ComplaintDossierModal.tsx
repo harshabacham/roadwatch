@@ -242,18 +242,19 @@ export function ComplaintDossierModal({
             </div>
           </div>
 
-          {/* Unsupervised Depth Estimation (Image Entropy + Relative Scale) */}
+          {/* Depth & Size Analysis */}
           {(complaint.estimatedDepthCm !== null &&
             complaint.estimatedDepthCm !== undefined) ||
           complaint.depthEstimationDetails ? (
             <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="text-xs font-semibold text-slate-800">
-                  Unsupervised Depth Estimation
+                  Depth &amp; Surface Assessment
                 </div>
                 <div className="text-[11px] text-slate-500">
-                  {complaint.depthEstimationDetails?.method ||
-                    'Shannon Image Entropy + Relative Scale'}
+                  {complaint.depthEstimationDetails?.confidenceRangeCm
+                    ? `Estimated range: ${complaint.depthEstimationDetails.confidenceRangeCm}`
+                    : 'Camera depth & scale assessment'}
                 </div>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
@@ -267,20 +268,19 @@ export function ComplaintDossierModal({
                 {complaint.depthEstimationDetails && (
                   <>
                     <div>
-                      <div className="text-slate-500">Shannon Entropy</div>
+                      <div className="text-slate-500">Surface Disruption</div>
                       <div className="font-mono font-semibold text-slate-900 mt-0.5">
-                        {complaint.depthEstimationDetails.shannonEntropyBits} bits (
-                        {complaint.depthEstimationDetails.entropyRatio}x)
+                        {complaint.depthEstimationDetails.entropyRatio}x vs road
                       </div>
                     </div>
                     <div>
-                      <div className="text-slate-500">Relative Scale</div>
+                      <div className="text-slate-500">Perspective Size</div>
                       <div className="font-mono font-semibold text-slate-900 mt-0.5">
-                        {complaint.depthEstimationDetails.relativeScaleIndex}
+                        {complaint.depthEstimationDetails.relativeScaleIndex} index
                       </div>
                     </div>
                     <div>
-                      <div className="text-slate-500">Shadow Occlusion</div>
+                      <div className="text-slate-500">Interior Shadow</div>
                       <div className="font-mono font-semibold text-slate-900 mt-0.5">
                         {complaint.depthEstimationDetails.shadowOcclusionPct}%
                       </div>

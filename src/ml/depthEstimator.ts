@@ -213,7 +213,7 @@ export function estimatePotholeDepthUnsupervised(
     estimatedDepthCm,
     depthClass,
     details: {
-      method: 'Shannon Image Entropy + Relative Scale Analysis (Unsupervised)',
+      method: 'Visual Surface & Perspective Scale Analysis',
       shannonEntropyBits: Number(roiEntropy.toFixed(2)),
       baselineEntropyBits: Number(safeBaselineEntropy.toFixed(2)),
       entropyRatio: Number(entropyRatio.toFixed(2)),

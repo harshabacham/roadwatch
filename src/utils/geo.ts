@@ -82,8 +82,8 @@ export function buildFormattedComplaintText(complaint: ComplaintRecord): string 
       ? `Estimated Depth: ${complaint.estimatedDepthCm} cm${
           complaint.depthClass ? ` (${complaint.depthClass})` : ''
         }${
-          complaint.depthEstimationDetails
-            ? ` | Entropy H=${complaint.depthEstimationDetails.shannonEntropyBits} bits, Scale=${complaint.depthEstimationDetails.relativeScaleIndex}`
+          complaint.depthEstimationDetails?.confidenceRangeCm
+            ? ` | Est. Range: ${complaint.depthEstimationDetails.confidenceRangeCm}`
             : ''
         }`
       : 'Estimated Depth: Not measured';

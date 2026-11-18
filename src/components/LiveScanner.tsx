@@ -78,10 +78,10 @@ const ROAD_SAMPLES = [
 ];
 
 const OVERLAY_MODES: Array<{ id: DiagnosticOverlayMode; label: string }> = [
-  { id: 'detections', label: 'Bounding Boxes' },
-  { id: 'kmeans', label: 'K-Means Clusters' },
-  { id: 'heatmap', label: 'Mahalanobis Heat' },
-  { id: 'dbscan', label: 'DBSCAN + Sobel' },
+  { id: 'detections', label: 'Hazard Boxes' },
+  { id: 'kmeans', label: 'Surface Zones' },
+  { id: 'heatmap', label: 'Damage Heatmap' },
+  { id: 'dbscan', label: 'Depth & Edges' },
 ];
 
 interface LiveScannerProps {
@@ -385,7 +385,7 @@ export function LiveScanner({
             overallSeverity: item.severity,
             detections: [item],
             formalComplaintTitle: `${item.severity} Pothole (${item.estimatedWidthCm} cm × ${item.estimatedDepthCm} cm deep)`,
-            formalComplaintDescription: `${item.hazardDescription} Estimated depth ${item.depthConfidenceRange} (${item.depthClass}), surface area ~${item.estimatedAreaSqCm} cm². Detected via Unsupervised K-Means++ (K=${mlParamsRef.current.kClusters}), Robust Mahalanobis Z=${item.mahalanobisZ}, and DBSCAN clustering.`,
+            formalComplaintDescription: `${item.hazardDescription} Estimated depth ${item.depthConfidenceRange} (${item.depthClass}), surface area ~${item.estimatedAreaSqCm} cm².`,
           },
           primaryItem: item,
           snapshotDataUrl,
@@ -754,10 +754,10 @@ export function LiveScanner({
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
           <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight text-balance">
-            Unsupervised ML Recording &amp; Auto-Complaint
+            Road Pothole Scanner
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            Start recording to detect potholes, depth, and GPS location via unsupervised clustering—then accept items from the list to raise complaints automatically.
+            Start recording to detect potholes, depth, and GPS location automatically—then review the list below to <strong>Approve</strong> or <strong>Reject</strong> each complaint.
           </p>
         </div>
 
@@ -836,7 +836,7 @@ export function LiveScanner({
                     </h2>
                     <p className="text-sm text-slate-300 mt-1 max-w-sm">
                       {cameraError ||
-                        'Allow rear camera access when prompted to start recording and unsupervised pothole detection.'}
+                        'Allow rear camera access when prompted to start recording and detect road potholes automatically.'}
                     </p>
                     <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
                       <button
@@ -910,11 +910,11 @@ export function LiveScanner({
               />
             )}
 
-            {/* Pixel-level Unsupervised ML Diagnostic Overlay */}
+            {/* Pixel-level Road Surface Overlay */}
             {overlayDataUrl && mlParams.overlayMode !== 'detections' && (
               <img
                 src={overlayDataUrl}
-                alt="Unsupervised ML diagnostic layer"
+                alt="Road surface inspection overlay"
                 className="absolute inset-0 w-full h-full object-cover pointer-events-none"
                 style={{ imageRendering: 'pixelated' }}
               />
@@ -1030,12 +1030,12 @@ export function LiveScanner({
             )}
           </div>
 
-          {/* Unsupervised ML Diagnostic Overlay Switcher */}
+          {/* Visual Overlay Switcher & Scan Settings */}
           <div className="bg-white border border-slate-200 rounded-2xl p-3.5 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
                 <Layers className="w-4 h-4 text-amber-600" />
-                <span>Unsupervised ML Diagnostic View</span>
+                <span>Inspection Overlay</span>
               </div>
 
               <button
@@ -1044,7 +1044,7 @@ export function LiveScanner({
                 className="text-xs font-medium text-slate-600 hover:text-slate-900 inline-flex items-center gap-1.5 cursor-pointer"
               >
                 <SlidersHorizontal className="w-3.5 h-3.5" />
-                {showHyperparams ? 'Hide Parameters' : 'Tune ML Parameters'}
+                {showHyperparams ? 'Hide Settings' : 'Scan Settings'}
               </button>
             </div>
 
@@ -1071,7 +1071,7 @@ export function LiveScanner({
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-100">
                 <div>
                   <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                    K-Means Clusters (K)
+                    Lighting &amp; Surface Zones
                   </label>
                   <select
                     value={mlParams.kClusters}
@@ -1081,17 +1081,17 @@ export function LiveScanner({
                         kClusters: Number(e.target.value),
                       }))
                     }
-                    className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs font-mono text-slate-900"
+                    className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
                   >
-                    <option value={3}>K = 3</option>
-                    <option value={4}>K = 4</option>
-                    <option value={5}>K = 5</option>
+                    <option value={3}>3 Zones (Simple Road)</option>
+                    <option value={4}>4 Zones (Standard)</option>
+                    <option value={5}>5 Zones (Mixed Shadows)</option>
                   </select>
                 </div>
 
                 <div>
                   <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                    Mahalanobis Sensitivity
+                    Detection Sensitivity
                   </label>
                   <select
                     value={mlParams.sensitivity}
@@ -1103,15 +1103,15 @@ export function LiveScanner({
                     }
                     className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
                   >
-                    <option value="conservative">Conservative (Z &ge; 2.90)</option>
-                    <option value="balanced">Balanced (Z &ge; 2.35)</option>
-                    <option value="sensitive">Sensitive (Z &ge; 1.95)</option>
+                    <option value="conservative">Strict (Major Hazards)</option>
+                    <option value="balanced">Balanced (Recommended)</option>
+                    <option value="sensitive">High (Includes Cracks)</option>
                   </select>
                 </div>
 
                 <div>
                   <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                    DBSCAN MinPts Density
+                    Minimum Hazard Size
                   </label>
                   <select
                     value={mlParams.dbscanMinPts}
@@ -1121,11 +1121,11 @@ export function LiveScanner({
                         dbscanMinPts: Number(e.target.value),
                       }))
                     }
-                    className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs font-mono text-slate-900"
+                    className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
                   >
-                    <option value={3}>MinPts = 3</option>
-                    <option value={4}>MinPts = 4</option>
-                    <option value={6}>MinPts = 6</option>
+                    <option value={3}>Small Hazards</option>
+                    <option value={4}>Standard Size</option>
+                    <option value={6}>Large Potholes Only</option>
                   </select>
                 </div>
               </div>
@@ -1188,30 +1188,28 @@ export function LiveScanner({
           {/* Recording Control Bar */}
           <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
             <div className="flex flex-wrap items-center gap-3">
-              {canRecord ? (
-                <button
-                  type="button"
-                  onClick={
-                    isRecording ? stopRecordingSession : startRecordingSession
-                  }
-                  className={`flex-1 min-w-[200px] min-h-[48px] px-5 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2 transition-all active:scale-[0.99] cursor-pointer ${
-                    isRecording
-                      ? 'bg-red-600 hover:bg-red-700 text-white'
-                      : 'bg-amber-600 hover:bg-amber-700 text-white'
-                  }`}
-                >
-                  {isRecording ? (
-                    <>
-                      <Square className="w-4 h-4 fill-current" />
-                      Stop Recording ({detectedList.length} detected)
-                    </>
-                  ) : (
-                    <>
-                      <Video className="w-4 h-4" />
-                      Start Recording (Detect Potholes &amp; Depth)
-                    </>
-                  )}
-                </button>
+              {sourceMode === 'camera' ||
+              (sourceMode === 'upload' && uploadedKind === 'video') ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={startRecordingSession}
+                    disabled={!canRecord || isRecording}
+                    className="flex-1 min-w-[160px] min-h-[48px] px-5 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2 transition-all active:scale-[0.99] bg-amber-600 hover:bg-amber-700 disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed text-white cursor-pointer"
+                  >
+                    <Video className="w-4 h-4" />
+                    {isRecording ? 'Recording...' : 'Start Recording'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={stopRecordingSession}
+                    disabled={!isRecording}
+                    className="flex-1 min-w-[160px] min-h-[48px] px-5 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2 transition-all active:scale-[0.99] bg-red-600 hover:bg-red-700 disabled:bg-slate-100 disabled:text-slate-400 disabled:border disabled:border-slate-200 disabled:cursor-not-allowed text-white cursor-pointer"
+                  >
+                    <Square className="w-4 h-4 fill-current" />
+                    Stop Recording{isRecording ? ` (${detectedList.length})` : ''}
+                  </button>
+                </>
               ) : (
                 <button
                   type="button"
@@ -1227,8 +1225,8 @@ export function LiveScanner({
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600 pt-1 border-t border-slate-100">
               <span>
                 {isRecording
-                  ? 'Unsupervised ML is detecting potholes, depth, and GPS live while recording...'
-                  : 'Detection runs automatically while recording and populates the review list below.'}
+                  ? 'Scanning road live for potholes, depth, and GPS while recording...'
+                  : 'Camera stays on standby until you tap Start Recording.'}
               </span>
 
               {recordedVideoUrl && (
@@ -1372,45 +1370,45 @@ export function LiveScanner({
             </div>
           </div>
 
-          {/* Unsupervised ML Pipeline Telemetry */}
+          {/* Live Road Inspection Summary */}
           <div className="bg-white border border-slate-200 rounded-2xl p-5 flex-1 flex flex-col justify-between space-y-4">
             {mlMetrics ? (
               <div className="space-y-3.5">
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="font-display text-base font-semibold text-slate-900">
-                    Unsupervised ML Telemetry
+                    Live Scan Summary
                   </h2>
                   <span className="font-mono text-xs text-slate-500">
-                    {mlMetrics.roadPatches} patches · {mlMetrics.inferenceMs}ms
+                    {mlMetrics.roadPatches} areas · {mlMetrics.inferenceMs}ms
                   </span>
                 </div>
 
                 <div className="grid grid-cols-3 gap-2.5">
                   <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                    <div className="text-[11px] text-slate-500">K-Means WCSS</div>
-                    <div className="font-mono text-sm font-semibold text-slate-900">
-                      {mlMetrics.wcss}
-                    </div>
-                    <div className="font-mono text-[10px] text-slate-500">
-                      {mlMetrics.kmeansIterations} iters
-                    </div>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                    <div className="text-[11px] text-slate-500">Silhouette</div>
-                    <div className="font-mono text-sm font-semibold text-slate-900">
-                      {mlMetrics.silhouetteScore}
-                    </div>
-                    <div className="font-mono text-[10px] text-slate-500">
-                      Z &ge; {mlMetrics.anomalyThresholdZ}
-                    </div>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                    <div className="text-[11px] text-slate-500">DBSCAN Groups</div>
+                    <div className="text-[11px] text-slate-500">Hazards Found</div>
                     <div className="font-mono text-sm font-semibold text-slate-900">
                       {mlMetrics.dbscanClustersFound}
                     </div>
                     <div className="font-mono text-[10px] text-slate-500">
-                      {mlMetrics.noisePatchesPruned} noise pruned
+                      {activeDetections.length > 0 ? 'Active frame' : 'Road clear'}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                    <div className="text-[11px] text-slate-500">Road Baseline</div>
+                    <div className="font-mono text-sm font-semibold text-slate-900">
+                      {Math.round(mlMetrics.baselineLuminanceMean * 100)}% tone
+                    </div>
+                    <div className="font-mono text-[10px] text-slate-500">
+                      Auto-calibrated
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                    <div className="text-[11px] text-slate-500">Scan Speed</div>
+                    <div className="font-mono text-sm font-semibold text-slate-900">
+                      {mlMetrics.inferenceMs} ms
+                    </div>
+                    <div className="font-mono text-[10px] text-slate-500">
+                      On-device
                     </div>
                   </div>
                 </div>
@@ -1420,10 +1418,10 @@ export function LiveScanner({
                     <div key={c.clusterId} className="space-y-1">
                       <div className="flex items-center justify-between text-xs">
                         <span className="text-slate-700 font-medium truncate">
-                          C{c.clusterId + 1}: {c.role}
+                          {c.role}
                         </span>
                         <span className="font-mono text-slate-500 shrink-0">
-                          {c.percentage.toFixed(0)}% ({c.patchCount})
+                          {c.percentage.toFixed(0)}%
                         </span>
                       </div>
                       <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
@@ -1442,10 +1440,10 @@ export function LiveScanner({
             ) : (
               <div className="py-8 text-center space-y-2 my-auto">
                 <h2 className="font-display text-base font-semibold text-slate-900">
-                  Unsupervised ML Engine Ready
+                  Road Scanner Ready
                 </h2>
                 <p className="text-xs text-slate-600 max-w-xs mx-auto leading-relaxed">
-                  While recording, K-Means++ segments road asphalt, Median/MAD Mahalanobis scoring detects anomalies, and DBSCAN estimates pothole depth, area, and severity.
+                  While recording, RoadWatch automatically maps the road surface, detects potholes, estimates depth and size, and captures your GPS location.
                 </p>
               </div>
             )}
@@ -1467,7 +1465,7 @@ export function LiveScanner({
                 )}
                 ·{' '}
                 <strong className="font-mono text-emerald-700">
-                  {raisedCount} auto-raised
+                  {raisedCount} approved
                 </strong>
               </span>
               {pendingCount > 0 && (
@@ -1477,7 +1475,7 @@ export function LiveScanner({
                   onClick={handleAcceptAllPending}
                   className="font-semibold text-amber-700 hover:text-amber-800 cursor-pointer"
                 >
-                  {raisingAll ? 'Raising...' : 'Accept & Raise All'}
+                  {raisingAll ? 'Submitting...' : 'Approve All'}
                 </button>
               )}
             </div>
@@ -1485,7 +1483,7 @@ export function LiveScanner({
         </div>
       </div>
 
-      {/* Detected Potholes Detailed Review List (User Accepts -> Auto-Raises with Zero Involvement) */}
+      {/* Detected Potholes Detailed Review List (User Approves or Rejects before any complaint is filed) */}
       <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
@@ -1493,7 +1491,7 @@ export function LiveScanner({
               Detected Potholes &amp; Depth Report List ({detectedList.length})
             </h2>
             <p className="text-xs text-slate-600 mt-0.5">
-              Review detected pothole depth, dimensions, ML metrics, and location. Click <strong>Accept</strong> and the complaint is raised in the government portal automatically with no further input needed.
+              Complaints are never submitted automatically. Review each pothole&apos;s depth, size, and GPS location, then tap <strong>Approve</strong> to file or <strong>Reject</strong> to discard.
             </p>
           </div>
 
@@ -1506,8 +1504,8 @@ export function LiveScanner({
             >
               <CheckCheck className="w-4 h-4" />
               {raisingAll
-                ? 'Auto-Raising Complaints...'
-                : `Accept All & Auto-Raise (${pendingCount})`}
+                ? 'Submitting Approved...'
+                : `Approve All (${pendingCount})`}
             </button>
           )}
         </div>
@@ -1598,19 +1596,17 @@ export function LiveScanner({
                             </div>
                           </div>
                           <div className="px-2.5 py-1.5 rounded-lg bg-slate-50 border border-slate-200">
-                            <div className="text-[10px] text-slate-500">Image Entropy</div>
+                            <div className="text-[10px] text-slate-500">Surface Roughness</div>
                             <div className="font-mono text-xs font-semibold text-slate-900">
-                              {d.depthEstimationDetails
-                                ? `H=${d.depthEstimationDetails.shannonEntropyBits}b (${d.depthEstimationDetails.entropyRatio}x)`
-                                : `ΔL=${d.luminanceDropPct}%`}
+                              {d.roughnessScorePct}% rough
                             </div>
                           </div>
                           <div className="px-2.5 py-1.5 rounded-lg bg-slate-50 border border-slate-200">
-                            <div className="text-[10px] text-slate-500">Relative Scale &amp; Z</div>
+                            <div className="text-[10px] text-slate-500">Interior Shadow</div>
                             <div className="font-mono text-xs font-semibold text-slate-900">
                               {d.depthEstimationDetails
-                                ? `S=${d.depthEstimationDetails.relativeScaleIndex} · Z=${d.mahalanobisZ}`
-                                : `Z=${d.mahalanobisZ} · ${d.patchCount} pts`}
+                                ? `${d.depthEstimationDetails.shadowOcclusionPct}% shadow`
+                                : `${d.luminanceDropPct}% darker`}
                             </div>
                           </div>
                         </div>
@@ -1637,42 +1633,42 @@ export function LiveScanner({
                       </div>
                     </div>
 
-                    {/* Accept / Reject Action Column */}
+                    {/* Approve / Reject Action Column */}
                     <div className="flex flex-row lg:flex-col items-center lg:items-end justify-end gap-2 shrink-0">
                       {item.decision === 'pending' && (
                         <>
                           <button
                             type="button"
                             onClick={() => handleAcceptCandidate(item)}
-                            className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs sm:text-sm font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                            className="min-h-[44px] px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs sm:text-sm font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
                           >
                             <Check className="w-4 h-4" />
-                            Accept &amp; Auto-Raise
+                            Approve
                           </button>
                           <button
                             type="button"
                             onClick={() => handleRejectCandidate(item.candidateId)}
-                            className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                            className="min-h-[44px] px-4 py-2 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs sm:text-sm font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
                           >
                             <X className="w-4 h-4" />
-                            Dismiss
+                            Reject
                           </button>
                         </>
                       )}
 
                       {item.decision === 'raising' && (
                         <div className="px-4 py-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-800">
-                          Raising automatically on portal...
+                          Submitting to government portal...
                         </div>
                       )}
 
                       {item.decision === 'queued_offline' && (
                         <div className="flex flex-col items-start lg:items-end gap-1">
                           <div className="px-3 py-1.5 rounded-lg bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-900">
-                            Queued in IndexedDB (Offline)
+                            Approved · Queued Offline
                           </div>
                           <span className="text-[11px] text-slate-500">
-                            Will auto-submit when internet returns
+                            Will submit automatically when internet returns
                           </span>
                         </div>
                       )}
@@ -1681,7 +1677,7 @@ export function LiveScanner({
                         <div className="flex flex-col items-start lg:items-end gap-1.5">
                           <div className="px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-800 inline-flex items-center gap-1.5">
                             <Check className="w-3.5 h-3.5" />
-                            Auto-Raised ·{' '}
+                            Approved &amp; Filed ·{' '}
                             <span className="font-mono">
                               {item.raisedComplaint.externalTicketId ||
                                 item.raisedComplaint.trackingCode}
@@ -1698,8 +1694,8 @@ export function LiveScanner({
                       )}
 
                       {item.decision === 'rejected' && (
-                        <span className="text-xs font-medium text-slate-500">
-                          Dismissed by user
+                        <span className="text-xs font-medium text-red-600">
+                          Rejected by user
                         </span>
                       )}
                     </div>
