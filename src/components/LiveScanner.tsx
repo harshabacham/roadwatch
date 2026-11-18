@@ -34,7 +34,11 @@ import {
   analyzeFrameUnsupervised,
   ClusterProfile,
   DiagnosticOverlayMode,
+  getLearnedRoadBaseline,
+  LearnedRoadBaseline,
+  resetLearnedRoadBaseline,
   SensitivityPreset,
+  trainRoadBaselineFromSource,
   UnsupervisedMetrics,
   UnsupervisedParams,
 } from '../ml/unsupervisedDetector';
@@ -118,7 +122,7 @@ export function LiveScanner({
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
-  // Unsupervised ML Hyperparameters
+  // Unsupervised ML Hyperparameters & Online Road Baseline State
   const [mlParams, setMlParams] = useState<UnsupervisedParams>({
     kClusters: 4,
     sensitivity: 'balanced',
@@ -126,6 +130,10 @@ export function LiveScanner({
     overlayMode: 'detections',
   });
   const [showHyperparams, setShowHyperparams] = useState(false);
+  const [learnedBaseline, setLearnedBaseline] = useState<LearnedRoadBaseline>(
+    () => getLearnedRoadBaseline()
+  );
+  const [baselineNotice, setBaselineNotice] = useState<string | null>(null);
 
   // Upload & sample media state
   const [selectedSampleId, setSelectedSampleId] = useState<string>('severe');
@@ -436,6 +444,7 @@ export function LiveScanner({
       setMlMetrics(result.metrics);
       setClusterProfiles(result.clusters);
       setOverlayDataUrl(result.overlayDataUrl);
+      setLearnedBaseline(getLearnedRoadBaseline());
 
       if (result.detection.potholeDetected) {
         consecutiveHitsRef.current += 1;
@@ -1068,65 +1077,116 @@ export function LiveScanner({
             </div>
 
             {showHyperparams && (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-100">
-                <div>
-                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                    Lighting &amp; Surface Zones
-                  </label>
-                  <select
-                    value={mlParams.kClusters}
-                    onChange={(e) =>
-                      setMlParams((p) => ({
-                        ...p,
-                        kClusters: Number(e.target.value),
-                      }))
-                    }
-                    className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
-                  >
-                    <option value={3}>3 Zones (Simple Road)</option>
-                    <option value={4}>4 Zones (Standard)</option>
-                    <option value={5}>5 Zones (Mixed Shadows)</option>
-                  </select>
+              <div className="space-y-3 pt-2 border-t border-slate-100">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Lighting &amp; Surface Zones (GMM/K-Means)
+                    </label>
+                    <select
+                      value={mlParams.kClusters}
+                      onChange={(e) =>
+                        setMlParams((p) => ({
+                          ...p,
+                          kClusters: Number(e.target.value),
+                        }))
+                      }
+                      className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
+                    >
+                      <option value={3}>3 Zones (Simple Road)</option>
+                      <option value={4}>4 Zones (Standard)</option>
+                      <option value={5}>5 Zones (Mixed Shadows)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Detection Sensitivity
+                    </label>
+                    <select
+                      value={mlParams.sensitivity}
+                      onChange={(e) =>
+                        setMlParams((p) => ({
+                          ...p,
+                          sensitivity: e.target.value as SensitivityPreset,
+                        }))
+                      }
+                      className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
+                    >
+                      <option value="conservative">Strict (Major Hazards)</option>
+                      <option value="balanced">Balanced (Recommended)</option>
+                      <option value="sensitive">High (Includes Cracks)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Minimum Hazard Size (DBSCAN)
+                    </label>
+                    <select
+                      value={mlParams.dbscanMinPts}
+                      onChange={(e) =>
+                        setMlParams((p) => ({
+                          ...p,
+                          dbscanMinPts: Number(e.target.value),
+                        }))
+                      }
+                      className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
+                    >
+                      <option value={3}>Small Hazards</option>
+                      <option value={4}>Standard Size</option>
+                      <option value={6}>Large Potholes Only</option>
+                    </select>
+                  </div>
                 </div>
 
-                <div>
-                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                    Detection Sensitivity
-                  </label>
-                  <select
-                    value={mlParams.sensitivity}
-                    onChange={(e) =>
-                      setMlParams((p) => ({
-                        ...p,
-                        sensitivity: e.target.value as SensitivityPreset,
-                      }))
-                    }
-                    className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
-                  >
-                    <option value="conservative">Strict (Major Hazards)</option>
-                    <option value="balanced">Balanced (Recommended)</option>
-                    <option value="sensitive">High (Includes Cracks)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                    Minimum Hazard Size
-                  </label>
-                  <select
-                    value={mlParams.dbscanMinPts}
-                    onChange={(e) =>
-                      setMlParams((p) => ({
-                        ...p,
-                        dbscanMinPts: Number(e.target.value),
-                      }))
-                    }
-                    className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
-                  >
-                    <option value={3}>Small Hazards</option>
-                    <option value={4}>Standard Size</option>
-                    <option value={6}>Large Potholes Only</option>
-                  </select>
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100">
+                  <div className="text-[11px] text-slate-600">
+                    <span className="font-semibold text-slate-800">
+                      Online Unsupervised Baseline:
+                    </span>{' '}
+                    <span className="font-mono">
+                      {learnedBaseline.framesTrained} frames learned
+                    </span>
+                    {baselineNotice ? (
+                      <span className="ml-2 text-emerald-700 font-medium">
+                        {baselineNotice}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const mediaEl = getActiveMediaElement();
+                        if (!mediaEl) {
+                          setBaselineNotice('Open camera or load an image first.');
+                          return;
+                        }
+                        const next = trainRoadBaselineFromSource(mediaEl);
+                        if (next) {
+                          setLearnedBaseline(next);
+                          setBaselineNotice(
+                            `Calibrated (${next.framesTrained}f)`
+                          );
+                        }
+                      }}
+                      className="h-8 px-3 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold cursor-pointer"
+                    >
+                      Train on Normal Road
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const reset = resetLearnedRoadBaseline();
+                        setLearnedBaseline(reset);
+                        setBaselineNotice('Reset to default');
+                      }}
+                      className="h-8 px-2.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-[11px] font-medium cursor-pointer"
+                    >
+                      Reset
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
@@ -1399,16 +1459,18 @@ export function LiveScanner({
                       {Math.round(mlMetrics.baselineLuminanceMean * 100)}% tone
                     </div>
                     <div className="font-mono text-[10px] text-slate-500">
-                      Auto-calibrated
+                      {mlMetrics.trainedFrames > 0
+                        ? `Trained ${mlMetrics.trainedFrames}f`
+                        : 'Auto-calibrated'}
                     </div>
                   </div>
                   <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-                    <div className="text-[11px] text-slate-500">Scan Speed</div>
+                    <div className="text-[11px] text-slate-500">ML Silhouette</div>
                     <div className="font-mono text-sm font-semibold text-slate-900">
-                      {mlMetrics.inferenceMs} ms
+                      {mlMetrics.silhouetteScore.toFixed(2)}
                     </div>
                     <div className="font-mono text-[10px] text-slate-500">
-                      On-device
+                      {mlMetrics.inferenceMs} ms · iForest
                     </div>
                   </div>
                 </div>
