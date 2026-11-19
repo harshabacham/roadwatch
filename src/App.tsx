@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { TopNav, ActiveTab } from './components/TopNav';
 import { LiveScanner } from './components/LiveScanner';
-import { KaggleDatasetExplorer } from './components/KaggleDatasetExplorer';
 import { HazardMap } from './components/HazardMap';
 import { ComplaintLog } from './components/ComplaintLog';
 import { PortalSettings } from './components/PortalSettings';
-import { MLTrainingPanel } from './components/MLTrainingPanel';
 import { ComplaintDossierModal } from './components/ComplaintDossierModal';
 import { OfflineSyncBar } from './components/OfflineSyncBar';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
@@ -29,7 +27,6 @@ import {
   GeocodedLocation,
   OfflineQueueStats,
   Open311Config,
-  TrainedPotholeModel,
 } from './types';
 import { haversineMeters } from './utils/geo';
 
@@ -58,10 +55,6 @@ function loadSavedOpen311Config(): Open311Config {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('scanner');
-  const [externalScannerImage, setExternalScannerImage] = useState<{
-    url: string;
-    label: string;
-  } | null>(null);
   const [complaints, setComplaints] = useState<ComplaintRecord[]>([]);
   const [loadingComplaints, setLoadingComplaints] = useState(true);
   const [selectedComplaint, setSelectedComplaint] =
@@ -87,9 +80,6 @@ export default function App() {
   });
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncNotice, setLastSyncNotice] = useState<string | null>(null);
-  const [trainedModel, setTrainedModel] = useState<TrainedPotholeModel | null>(
-    null
-  );
 
   const lastGeocodedCoordsRef = useRef<{ lat: number; lng: number } | null>(
     null
@@ -216,7 +206,6 @@ export default function App() {
         if (res.ok) {
           const data = await res.json();
           if (data?.model) {
-            setTrainedModel(data.model);
             setTrainedClassifierModel(data.model);
           }
         }
@@ -374,16 +363,6 @@ export default function App() {
             onComplaintCreated={handleComplaintCreated}
             onOpenComplaint={(c) => setSelectedComplaint(c)}
             onDetectionsChanged={() => void refreshQueueStats()}
-            externalImage={externalScannerImage}
-          />
-        )}
-
-        {activeTab === 'dataset' && (
-          <KaggleDatasetExplorer
-            onOpenInScanner={(url, label) => {
-              setExternalScannerImage({ url, label });
-              setActiveTab('scanner');
-            }}
           />
         )}
 
@@ -402,16 +381,6 @@ export default function App() {
             loading={loadingComplaints}
             onSelectComplaint={(c) => setSelectedComplaint(c)}
             onOpenScanner={() => setActiveTab('scanner')}
-          />
-        )}
-
-        {activeTab === 'training' && (
-          <MLTrainingPanel
-            model={trainedModel}
-            onModelUpdated={(nextModel) => {
-              setTrainedModel(nextModel);
-              setTrainedClassifierModel(nextModel);
-            }}
           />
         )}
 

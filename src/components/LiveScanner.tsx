@@ -807,6 +807,26 @@ export function LiveScanner({
     void updateDetectionCandidate(candidateId, { decision: 'rejected' });
   }
 
+  function handleRejectAllPending() {
+    const pendingItems = detectedList.filter((d) => d.decision === 'pending');
+    if (pendingItems.length === 0) return;
+    const pendingIds = new Set(pendingItems.map((d) => d.candidateId));
+    setDetectedList((prev) =>
+      prev.map((item) =>
+        pendingIds.has(item.candidateId)
+          ? { ...item, decision: 'rejected', error: undefined }
+          : item
+      )
+    );
+    void Promise.all(
+      pendingItems.map((item) =>
+        updateDetectionCandidate(item.candidateId, { decision: 'rejected' })
+      )
+    ).then(() => {
+      onDetectionsChanged?.();
+    });
+  }
+
   function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1621,14 +1641,24 @@ export function LiveScanner({
                 </strong>
               </span>
               {pendingCount > 0 && (
-                <button
-                  type="button"
-                  disabled={raisingAll}
-                  onClick={handleAcceptAllPending}
-                  className="font-semibold text-amber-700 hover:text-amber-800 cursor-pointer"
-                >
-                  {raisingAll ? 'Submitting...' : 'Approve All'}
-                </button>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    type="button"
+                    disabled={raisingAll}
+                    onClick={handleRejectAllPending}
+                    className="font-semibold text-red-600 hover:text-red-700 disabled:opacity-50 cursor-pointer"
+                  >
+                    Reject All
+                  </button>
+                  <button
+                    type="button"
+                    disabled={raisingAll}
+                    onClick={handleAcceptAllPending}
+                    className="font-semibold text-amber-700 hover:text-amber-800 disabled:opacity-50 cursor-pointer"
+                  >
+                    {raisingAll ? 'Submitting...' : 'Approve All'}
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -1648,17 +1678,28 @@ export function LiveScanner({
           </div>
 
           {pendingCount > 0 && (
-            <button
-              type="button"
-              disabled={raisingAll}
-              onClick={handleAcceptAllPending}
-              className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
-            >
-              <CheckCheck className="w-4 h-4" />
-              {raisingAll
-                ? 'Submitting Approved...'
-                : `Approve All (${pendingCount})`}
-            </button>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={raisingAll}
+                onClick={handleRejectAllPending}
+                className="min-h-[44px] px-4 py-2 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 disabled:opacity-60 text-red-700 text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
+              >
+                <X className="w-4 h-4" />
+                Reject All ({pendingCount})
+              </button>
+              <button
+                type="button"
+                disabled={raisingAll}
+                onClick={handleAcceptAllPending}
+                className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
+              >
+                <CheckCheck className="w-4 h-4" />
+                {raisingAll
+                  ? 'Submitting Approved...'
+                  : `Approve All (${pendingCount})`}
+              </button>
+            </div>
           )}
         </div>
 

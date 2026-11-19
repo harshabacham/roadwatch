@@ -1,13 +1,7 @@
-import { Camera, Cpu, Database, FileText, Globe, MapPin } from 'lucide-react';
+import { Camera, FileText, Globe, MapPin } from 'lucide-react';
 import { PWAInstallButton } from './PWAInstallButton';
 
-export type ActiveTab =
-  | 'scanner'
-  | 'dataset'
-  | 'map'
-  | 'complaints'
-  | 'training'
-  | 'portals';
+export type ActiveTab = 'scanner' | 'map' | 'complaints' | 'portals';
 
 interface TopNavProps {
   activeTab: ActiveTab;
@@ -22,22 +16,18 @@ export function TopNav({
 }: TopNavProps) {
   const navItems: { id: ActiveTab; label: string }[] = [
     { id: 'scanner', label: 'Live Scanner' },
-    { id: 'dataset', label: 'Kaggle Dataset' },
     { id: 'map', label: 'Hazard Map' },
     {
       id: 'complaints',
       label: complaintCount > 0 ? `Complaints (${complaintCount})` : 'Complaints',
     },
-    { id: 'training', label: 'Model Training' },
     { id: 'portals', label: 'Govt Portals' },
   ];
 
   const mobileTabs: { id: ActiveTab; label: string; icon: typeof Camera }[] = [
     { id: 'scanner', label: 'Scanner', icon: Camera },
-    { id: 'dataset', label: 'Dataset', icon: Database },
     { id: 'map', label: 'Map', icon: MapPin },
     { id: 'complaints', label: 'Reports', icon: FileText },
-    { id: 'training', label: 'Model', icon: Cpu },
     { id: 'portals', label: 'Portals', icon: Globe },
   ];
 
@@ -99,7 +89,7 @@ export function TopNav({
         aria-label="Mobile navigation"
         className="no-print md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe"
       >
-        <div className="grid grid-cols-6 h-15 items-center">
+        <div className="grid grid-cols-4 h-15 items-center">
           {mobileTabs.map((tab) => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;
