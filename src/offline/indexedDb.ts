@@ -111,6 +111,18 @@ export async function clearFinishedDetections(): Promise<void> {
   }
 }
 
+export async function deleteAllDetectionCandidates(): Promise<void> {
+  try {
+    const db = await openRoadWatchDB();
+    const tx = db.transaction(STORE_DETECTIONS, 'readwrite');
+    tx.objectStore(STORE_DETECTIONS).clear();
+    await idbTxComplete(tx);
+    db.close();
+  } catch {
+    // Non-fatal
+  }
+}
+
 // --- Pending Offline Complaints Queue Store ---
 
 export async function enqueuePendingComplaint(

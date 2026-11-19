@@ -15,6 +15,7 @@ import {
   RefreshCw,
   SlidersHorizontal,
   Square,
+  Trash2,
   Upload,
   Video,
   X,
@@ -49,6 +50,7 @@ import {
 } from '../ml/unsupervisedDetector';
 import {
   clearFinishedDetections,
+  deleteAllDetectionCandidates,
   getAllDetectionCandidates,
   pendingQueueItemToComplaintRecord,
   saveDetectionCandidate,
@@ -1198,6 +1200,18 @@ export function LiveScanner({
     });
   }
 
+  function handleDeleteAllDetected() {
+    if (detectedList.length === 0) return;
+    setDetectedList([]);
+    sessionCapturedRef.current = [];
+    videoTrackersByFileRef.current.clear();
+    videoTrackerRef.current.reset();
+    cameraTrackerRef.current.reset();
+    void deleteAllDetectionCandidates().then(() => {
+      onDetectionsChanged?.();
+    });
+  }
+
   function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2222,9 +2236,9 @@ export function LiveScanner({
             </p>
           </div>
 
-          {(pendingCount > 0 || finishedCount > 0) && (
+          {detectedList.length > 0 && (
             <div className="flex flex-wrap items-center gap-2 shrink-0">
-              {finishedCount > 0 && (
+              {finishedCount > 0 && finishedCount < detectedList.length && (
                 <button
                   type="button"
                   disabled={raisingAll}
@@ -2234,6 +2248,15 @@ export function LiveScanner({
                   Clear Reviewed ({finishedCount})
                 </button>
               )}
+              <button
+                type="button"
+                disabled={raisingAll}
+                onClick={handleDeleteAllDetected}
+                className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-red-50 hover:border-red-200 hover:text-red-700 disabled:opacity-60 text-slate-700 text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-1.5 shrink-0 cursor-pointer transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+                Delete All ({detectedList.length})
+              </button>
               {pendingCount > 0 && (
                 <>
                   <button
