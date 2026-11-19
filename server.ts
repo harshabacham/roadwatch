@@ -6,6 +6,10 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
+import {
+  runPythonPotholeInference,
+  shutdownPythonPotholeWorker,
+} from './server/pythonModelBridge.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -263,17 +267,10 @@ async function startServer() {
     res.json({ ok: true, timestamp: new Date().toISOString() });
   });
 
-  // Server-side Roboflow Serverless Inference proxy (header-based API key auth)
+  // Server-side Python Pothole Detection Model endpoint (runs persistent Python 3 worker)
   app.post('/api/detect/roboflow', async (req: Request, res: Response) => {
     try {
-      const apiUrl = (
-        process.env.ROBOFLOW_API_URL || 'https://serverless.roboflow.com'
-      ).replace(/\/+$/, '');
-      const modelId = (
-        process.env.ROBOFLOW_MODEL_ID || 'pothole-detection-bqu6s-dwjbo/1'
-      ).replace(/^\/+/, '');
       const apiKey = (process.env.ROBOFLOW_API_KEY || '').trim();
-
       if (!apiKey) {
         return res.status(503).json({
           error: 'ROBOFLOW_API_KEY is not configured on the server.',
@@ -298,56 +295,23 @@ async function startServer() {
         });
       }
 
-      const params = new URLSearchParams();
-      if (Number.isFinite(Number(confidence))) {
-        const confVal = Math.max(0.05, Math.min(0.99, Number(confidence)));
-        params.set('confidence', confVal.toFixed(2));
-      }
-      if (Number.isFinite(Number(overlap))) {
-        const ovVal = Math.max(0.05, Math.min(0.99, Number(overlap)));
-        params.set('overlap', ovVal.toFixed(2));
-      }
+      const confVal = Number.isFinite(Number(confidence))
+        ? Math.max(0.05, Math.min(0.99, Number(confidence)))
+        : 0.28;
+      const ovVal = Number.isFinite(Number(overlap))
+        ? Math.max(0.05, Math.min(0.99, Number(overlap)))
+        : 0.45;
 
-      const queryString = params.toString();
-      const endpoint = `${apiUrl}/${modelId}${queryString ? `?${queryString}` : ''}`;
-
-      const startedAt = performance.now();
-      const upstream = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: rawBase64,
-        signal: AbortSignal.timeout(15000),
+      const pyResult = await runPythonPotholeInference({
+        imageBase64: rawBase64,
+        confidence: confVal,
+        overlap: ovVal,
       });
 
-      const responseText = await upstream.text();
-      if (!upstream.ok) {
-        return res.status(upstream.status).json({
-          error: `Roboflow inference failed (HTTP ${upstream.status})`,
-          details: responseText.slice(0, 300),
-        });
-      }
-
-      const data: any = JSON.parse(responseText);
-      const elapsedMs = Number(
-        (
-          (typeof data.time === 'number' ? data.time * 1000 : null) ??
-          performance.now() - startedAt
-        ).toFixed(1)
-      );
-
-      return res.json({
-        inferenceId: data.inference_id || '',
-        inferenceMs: elapsedMs,
-        modelId: data.resolved_model?.model_id || modelId,
-        image: data.image || { width: 0, height: 0 },
-        predictions: Array.isArray(data.predictions) ? data.predictions : [],
-      });
+      return res.json(pyResult);
     } catch (err: any) {
       return res.status(502).json({
-        error: err?.message || 'Failed to reach Roboflow inference API.',
+        error: err?.message || 'Python pothole model inference failed.',
       });
     }
   });
@@ -1033,6 +997,11 @@ async function startServer() {
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`RoadWatch server running at http://0.0.0.0:${PORT}`);
   });
+
+  const cleanupWorker = () => shutdownPythonPotholeWorker();
+  process.once('SIGINT', cleanupWorker);
+  process.once('SIGTERM', cleanupWorker);
+  process.once('exit', cleanupWorker);
 }
 
 startServer();
