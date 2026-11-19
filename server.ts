@@ -1,9 +1,13 @@
 import 'dotenv/config';
+import { execFile } from 'child_process';
 import express, { type Request, type Response } from 'express';
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,6 +15,10 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(__dirname, 'data');
 const COMPLAINTS_FILE = path.join(DATA_DIR, 'complaints.json');
+const KAGGLE_JSON_FILE = path.join(DATA_DIR, 'kaggle_pothole_dataset.json');
+const KAGGLE_CSV_FILE = path.join(DATA_DIR, 'kaggle_pothole_dataset.csv');
+const KAGGLE_IMAGES_DIR = path.join(DATA_DIR, 'kaggle_images');
+const KAGGLE_IMPORTER_SCRIPT = path.resolve(__dirname, 'ml', 'import_kaggle_dataset.py');
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -311,6 +319,144 @@ async function startServer() {
     } catch (err: any) {
       return res.status(502).json({
         error: err?.message || 'Failed to reach Roboflow inference API.',
+      });
+    }
+  });
+
+  // Imported Kaggle dataset (andrewmvd/pothole-detection): metadata & paginated records
+  const inFlightKaggleFetches = new Map<string, Promise<string>>();
+
+  app.get('/api/datasets/kaggle', (req: Request, res: Response) => {
+    if (!fs.existsSync(KAGGLE_JSON_FILE)) {
+      return res.status(404).json({
+        error: 'Kaggle dataset not imported yet. Trigger POST /api/datasets/kaggle/import.',
+      });
+    }
+
+    try {
+      const catalog = JSON.parse(fs.readFileSync(KAGGLE_JSON_FILE, 'utf-8'));
+      const allRecords: any[] = Array.isArray(catalog.records) ? catalog.records : [];
+      const search = String(req.query.search || '').trim().toLowerCase();
+      const minBoxes = Number(req.query.minBoxes) || 0;
+      const page = Math.max(1, Number(req.query.page) || 1);
+      const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 24));
+
+      const cachedSet = new Set<string>(
+        fs.existsSync(KAGGLE_IMAGES_DIR) ? fs.readdirSync(KAGGLE_IMAGES_DIR) : []
+      );
+
+      let filtered = allRecords;
+      if (search) {
+        filtered = filtered.filter(
+          (r) =>
+            String(r.id || '').toLowerCase().includes(search) ||
+            String(r.filename || '').toLowerCase().includes(search)
+        );
+      }
+      if (minBoxes > 0) {
+        filtered = filtered.filter((r) => Number(r.boxCount || 0) >= minBoxes);
+      }
+
+      const startIdx = (page - 1) * limit;
+      const pageRecords = filtered.slice(startIdx, startIdx + limit).map((r) => ({
+        ...r,
+        cachedLocally: cachedSet.has(r.filename),
+      }));
+
+      return res.json({
+        dataset: catalog.dataset || 'andrewmvd/pothole-detection',
+        sourceUrl:
+          catalog.sourceUrl || 'https://www.kaggle.com/datasets/andrewmvd/pothole-detection',
+        format: catalog.format || 'Pascal VOC XML + PNG Images',
+        importedAt: catalog.importedAt || '',
+        totalImages: catalog.totalImages || allRecords.length,
+        totalBoxes: catalog.totalBoxes || 0,
+        avgBoxesPerImage: catalog.avgBoxesPerImage || 0,
+        cachedImageCount: cachedSet.size,
+        page,
+        limit,
+        totalFiltered: filtered.length,
+        records: pageRecords,
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error: err?.message || 'Failed to read Kaggle dataset catalog.',
+      });
+    }
+  });
+
+  // Serve any of the 665 Kaggle pothole images (cached locally or streamed on demand via Range)
+  app.get('/api/datasets/kaggle/image/:filename', async (req: Request, res: Response) => {
+    const filename = path.basename(String(req.params.filename || ''));
+    if (!/^[a-zA-Z0-9._-]+\.(png|jpg|jpeg)$/i.test(filename)) {
+      return res.status(400).json({ error: 'Invalid image filename.' });
+    }
+
+    const localPath = path.join(KAGGLE_IMAGES_DIR, filename);
+    const sendImage = (filePath: string) => {
+      const ext = path.extname(filePath).toLowerCase();
+      res.setHeader('Content-Type', ext === '.png' ? 'image/png' : 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.sendFile(filePath);
+    };
+
+    if (fs.existsSync(localPath) && fs.statSync(localPath).size > 0) {
+      return sendImage(localPath);
+    }
+
+    try {
+      let pending = inFlightKaggleFetches.get(filename);
+      if (!pending) {
+        pending = execFileAsync(
+          'python3',
+          [KAGGLE_IMPORTER_SCRIPT, '--fetch-image', filename],
+          { timeout: 45000 }
+        )
+          .then(() => localPath)
+          .finally(() => {
+            inFlightKaggleFetches.delete(filename);
+          });
+        inFlightKaggleFetches.set(filename, pending);
+      }
+
+      const resolvedPath = await pending;
+      if (fs.existsSync(resolvedPath)) {
+        return sendImage(resolvedPath);
+      }
+      return res.status(404).json({ error: 'Image not found in Kaggle dataset.' });
+    } catch (err: any) {
+      return res.status(502).json({
+        error: err?.message || 'Failed to stream image from Kaggle dataset.',
+      });
+    }
+  });
+
+  // Download imported Kaggle annotations table as CSV
+  app.get('/api/datasets/kaggle/export.csv', (_req: Request, res: Response) => {
+    if (!fs.existsSync(KAGGLE_CSV_FILE)) {
+      return res.status(404).json({ error: 'Kaggle CSV export not generated yet.' });
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="andrewmvd-pothole-detection.csv"'
+    );
+    return res.sendFile(KAGGLE_CSV_FILE);
+  });
+
+  // Re-sync Kaggle dataset catalog on demand
+  app.post('/api/datasets/kaggle/import', async (_req: Request, res: Response) => {
+    try {
+      const { stdout } = await execFileAsync(
+        'python3',
+        [KAGGLE_IMPORTER_SCRIPT, '--precache', '12'],
+        { timeout: 120000 }
+      );
+      const summary = JSON.parse(stdout);
+      return res.json({ ok: true, summary });
+    } catch (err: any) {
+      return res.status(500).json({
+        error: err?.message || 'Failed to import Kaggle dataset.',
       });
     }
   });

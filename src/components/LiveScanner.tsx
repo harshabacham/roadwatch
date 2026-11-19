@@ -121,6 +121,7 @@ interface LiveScannerProps {
   onComplaintCreated: (complaint: ComplaintRecord) => void;
   onOpenComplaint: (complaint: ComplaintRecord) => void;
   onDetectionsChanged?: () => void;
+  externalImage?: { url: string; label: string } | null;
 }
 
 export function LiveScanner({
@@ -134,6 +135,7 @@ export function LiveScanner({
   onComplaintCreated,
   onOpenComplaint,
   onDetectionsChanged,
+  externalImage,
 }: LiveScannerProps) {
   const [sourceMode, setSourceMode] = useState<SourceMode>('camera');
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
@@ -274,6 +276,21 @@ export function LiveScanner({
       stopCameraStream();
     };
   }, [sourceMode, facingMode, startCamera, stopCameraStream]);
+
+  useEffect(() => {
+    if (!externalImage?.url) return;
+    setUploadedFileUrl((prev) => {
+      if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+      return externalImage.url;
+    });
+    setUploadedKind('image');
+    setSourceMode('upload');
+    setLastDetection(null);
+    setMlMetrics(null);
+    setClusterProfiles([]);
+    setOverlayDataUrl('');
+    setScanError(null);
+  }, [externalImage]);
 
   useEffect(() => {
     let active = true;
@@ -793,7 +810,9 @@ export function LiveScanner({
   function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (uploadedFileUrl) URL.revokeObjectURL(uploadedFileUrl);
+    if (uploadedFileUrl && uploadedFileUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(uploadedFileUrl);
+    }
     const url = URL.createObjectURL(file);
     setUploadedFileUrl(url);
     setUploadedKind(file.type.startsWith('video/') ? 'video' : 'image');

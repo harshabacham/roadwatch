@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { TopNav, ActiveTab } from './components/TopNav';
 import { LiveScanner } from './components/LiveScanner';
+import { KaggleDatasetExplorer } from './components/KaggleDatasetExplorer';
 import { HazardMap } from './components/HazardMap';
 import { ComplaintLog } from './components/ComplaintLog';
 import { PortalSettings } from './components/PortalSettings';
@@ -57,6 +58,10 @@ function loadSavedOpen311Config(): Open311Config {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('scanner');
+  const [externalScannerImage, setExternalScannerImage] = useState<{
+    url: string;
+    label: string;
+  } | null>(null);
   const [complaints, setComplaints] = useState<ComplaintRecord[]>([]);
   const [loadingComplaints, setLoadingComplaints] = useState(true);
   const [selectedComplaint, setSelectedComplaint] =
@@ -369,6 +374,16 @@ export default function App() {
             onComplaintCreated={handleComplaintCreated}
             onOpenComplaint={(c) => setSelectedComplaint(c)}
             onDetectionsChanged={() => void refreshQueueStats()}
+            externalImage={externalScannerImage}
+          />
+        )}
+
+        {activeTab === 'dataset' && (
+          <KaggleDatasetExplorer
+            onOpenInScanner={(url, label) => {
+              setExternalScannerImage({ url, label });
+              setActiveTab('scanner');
+            }}
           />
         )}
 

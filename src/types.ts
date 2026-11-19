@@ -259,4 +259,37 @@ export interface TrainedPotholeModel {
   metrics: ModelEvaluationMetrics;
 }
 
+export interface KagglePotholeBox {
+  label: string;
+  xmin: number;
+  ymin: number;
+  xmax: number;
+  ymax: number;
+}
 
+export interface KagglePotholeRecord {
+  id: string;
+  filename: string;
+  annotationFile: string;
+  width: number;
+  height: number;
+  fileSizeBytes: number;
+  boxCount: number;
+  boxes: KagglePotholeBox[];
+  cachedLocally?: boolean;
+}
+
+export interface KaggleDatasetResponse {
+  dataset: string;
+  sourceUrl: string;
+  format: string;
+  importedAt: string;
+  totalImages: number;
+  totalBoxes: number;
+  avgBoxesPerImage: number;
+  cachedImageCount: number;
+  page: number;
+  limit: number;
+  totalFiltered: number;
+  records: KagglePotholeRecord[];
+}
