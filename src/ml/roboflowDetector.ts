@@ -39,21 +39,49 @@ export interface RoboflowProxyResponse {
 const ANALYSIS_W = 240;
 const ANALYSIS_H = 180;
 
+export interface FrameCaptureOptions {
+  isVideoStream?: boolean;
+  maxDimension?: number;
+  jpegQuality?: number;
+}
+
+export interface DownsampledFrameInfo {
+  width: number;
+  height: number;
+  sourceWidth: number;
+  sourceHeight: number;
+}
+
+let reusableCaptureCanvas: HTMLCanvasElement | null = null;
+let reusableAnalysisCanvas: HTMLCanvasElement | null = null;
+
 function getConfidenceThreshold(sensitivity: SensitivityPreset): number {
   switch (sensitivity) {
     case 'conservative':
-      return 0.55;
+      return 0.48;
     case 'sensitive':
-      return 0.25;
+      return 0.18;
     case 'balanced':
     default:
-      return 0.4;
+      return 0.28;
   }
 }
 
 function captureFrameForRoboflow(
-  source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement
-): { dataUrl: string; width: number; height: number } | null {
+  source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement,
+  options?: FrameCaptureOptions
+): {
+  canvas: HTMLCanvasElement;
+  dataUrl: string;
+  width: number;
+  height: number;
+  sourceWidth: number;
+  sourceHeight: number;
+} | null {
+  if (source instanceof HTMLVideoElement && source.readyState < 2) {
+    return null;
+  }
+
   const srcWidth =
     source instanceof HTMLVideoElement
       ? source.videoWidth
@@ -69,22 +97,40 @@ function captureFrameForRoboflow(
 
   if (!srcWidth || !srcHeight) return null;
 
-  const maxDim = 960;
+  const isVideo =
+    options?.isVideoStream ?? source instanceof HTMLVideoElement;
+  const maxDim = Math.max(
+    240,
+    Math.min(1280, options?.maxDimension ?? (isVideo ? 640 : 960))
+  );
+  const jpegQuality = Math.max(
+    0.45,
+    Math.min(0.95, options?.jpegQuality ?? (isVideo ? 0.72 : 0.85))
+  );
+
   const scale = Math.min(1, maxDim / Math.max(srcWidth, srcHeight));
   const width = Math.max(1, Math.round(srcWidth * scale));
   const height = Math.max(1, Math.round(srcHeight * scale));
 
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
+  const canvas = reusableCaptureCanvas || document.createElement('canvas');
+  reusableCaptureCanvas = canvas;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
   const ctx = canvas.getContext('2d');
   if (!ctx) return null;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = isVideo ? 'medium' : 'high';
   ctx.drawImage(source, 0, 0, width, height);
 
   return {
-    dataUrl: canvas.toDataURL('image/jpeg', 0.85),
+    canvas,
+    dataUrl: canvas.toDataURL('image/jpeg', jpegQuality),
     width,
     height,
+    sourceWidth: srcWidth,
+    sourceHeight: srcHeight,
   };
 }
 
@@ -96,9 +142,12 @@ function extractFrameLuminanceAndGradient(
   baselineLuminance: number;
   baselineEntropyBits: number;
 } | null {
-  const canvas = document.createElement('canvas');
-  canvas.width = ANALYSIS_W;
-  canvas.height = ANALYSIS_H;
+  const canvas = reusableAnalysisCanvas || document.createElement('canvas');
+  reusableAnalysisCanvas = canvas;
+  if (canvas.width !== ANALYSIS_W || canvas.height !== ANALYSIS_H) {
+    canvas.width = ANALYSIS_W;
+    canvas.height = ANALYSIS_H;
+  }
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return null;
 
@@ -183,34 +232,51 @@ function estimateSeverity(
 export interface RoboflowDetectionOutput extends UnsupervisedAnalysisOutput {
   engine: 'roboflow' | 'offline-fallback';
   modelId: string;
+  /** Exact downsampled frame snapshot captured at inference time (prevents motion drift on video streams). */
+  snapshotDataUrl: string;
+  downsampledSize: DownsampledFrameInfo;
 }
 
 /**
  * Primary pothole detector backed by the server-side Roboflow Serverless Inference proxy
  * (`/api/detect/roboflow`, using header-based auth) enriched with physical width/depth
  * estimation via Shannon image entropy and perspective geometry.
+ * Explicitly downsamples video stream frames onto a frozen canvas before inference so
+ * depth analysis, bounding boxes, and thumbnails remain locked to the exact analyzed frame.
  * Automatically falls back to on-device unsupervised detection when offline.
  */
 export async function detectPotholesWithRoboflow(
   source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement,
-  params: UnsupervisedParams
+  params: UnsupervisedParams,
+  options?: FrameCaptureOptions
 ): Promise<RoboflowDetectionOutput | null> {
-  const frame = captureFrameForRoboflow(source);
+  const frame = captureFrameForRoboflow(source, options);
   if (!frame) return null;
 
-  // Optionally generate diagnostic surface overlay if user selected a non-box overlay mode
+  const downsampledSize: DownsampledFrameInfo = {
+    width: frame.width,
+    height: frame.height,
+    sourceWidth: frame.sourceWidth,
+    sourceHeight: frame.sourceHeight,
+  };
+
+  // Compute surface features & optional diagnostic overlay on the exact frozen frame BEFORE async fetch
+  const surface = extractFrameLuminanceAndGradient(frame.canvas);
   const localOverlayPass =
     params.overlayMode !== 'detections'
-      ? analyzeFrameUnsupervised(source, params)
+      ? analyzeFrameUnsupervised(frame.canvas, params)
       : null;
 
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
-    const offline = localOverlayPass || analyzeFrameUnsupervised(source, params);
+    const offline =
+      localOverlayPass || analyzeFrameUnsupervised(frame.canvas, params);
     if (!offline) return null;
     return {
       ...offline,
       engine: 'offline-fallback',
       modelId: 'offline-local-cv',
+      snapshotDataUrl: frame.dataUrl,
+      downsampledSize,
     };
   }
 
@@ -246,7 +312,6 @@ export async function detectPotholesWithRoboflow(
       .filter((p) => (p.confidence ?? 0) >= confidenceThreshold)
       .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
 
-    const surface = extractFrameLuminanceAndGradient(source);
     const detections: PotholeDetectionItem[] = [];
 
     for (let idx = 0; idx < filteredPredictions.length; idx++) {
@@ -497,15 +562,20 @@ export async function detectPotholesWithRoboflow(
       overlayDataUrl: localOverlayPass?.overlayDataUrl || '',
       engine: 'roboflow',
       modelId: payload.modelId || 'pothole-detection-bqu6s-dwjbo/1',
+      snapshotDataUrl: frame.dataUrl,
+      downsampledSize,
     };
   } catch (err) {
     console.warn('Roboflow inference failed, falling back to offline detector:', err);
-    const offline = localOverlayPass || analyzeFrameUnsupervised(source, params);
+    const offline =
+      localOverlayPass || analyzeFrameUnsupervised(frame.canvas, params);
     if (!offline) return null;
     return {
       ...offline,
       engine: 'offline-fallback',
       modelId: 'offline-local-cv',
+      snapshotDataUrl: frame.dataUrl,
+      downsampledSize,
     };
   }
 }

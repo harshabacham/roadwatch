@@ -10,6 +10,8 @@ import {
   Image as ImageIcon,
   Layers,
   MapPin,
+  Pause,
+  Play,
   RefreshCw,
   SlidersHorizontal,
   Square,
@@ -55,6 +57,11 @@ import {
 } from '../offline/syncManager';
 
 import { detectPotholesWithRoboflow } from '../ml/roboflowDetector';
+import {
+  VideoStreamDetectionPipeline,
+  type VideoStreamConfig,
+  type VideoStreamStats,
+} from '../ml/videoStreamProcessor';
 import severeSampleUrl from '../assets/images/road_sample_severe_1795005146352.jpg';
 import moderateSampleUrl from '../assets/images/road_sample_moderate_1795005146362.jpg';
 import waterloggedSampleUrl from '../assets/images/road_sample_waterlogged_1795005147911.jpg';
@@ -140,8 +147,8 @@ export function LiveScanner({
   const [sourceMode, setSourceMode] = useState<SourceMode>('camera');
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [cameraStatus, setCameraStatus] = useState<
-    'requesting' | 'ready' | 'error'
-  >('requesting');
+    'idle' | 'requesting' | 'ready' | 'error'
+  >('idle');
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
@@ -163,11 +170,32 @@ export function LiveScanner({
   const [selectedSampleId, setSelectedSampleId] = useState<string>('severe');
   const [uploadedFileUrl, setUploadedFileUrl] = useState<string | null>(null);
   const [uploadedKind, setUploadedKind] = useState<'image' | 'video'>('image');
+  const [uploadedVideoDims, setUploadedVideoDims] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
+  const [videoOverlayRect, setVideoOverlayRect] = useState<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  } | null>(null);
+
+  // Video stream downsampling & frame-skip pipeline settings
+  const [videoStreamConfig, setVideoStreamConfig] = useState<VideoStreamConfig>({
+    frameSkipInterval: 5,
+    maxDimension: 640,
+    jpegQuality: 0.72,
+    minIntervalMs: 160,
+  });
+  const [videoStreamStats, setVideoStreamStats] =
+    useState<VideoStreamStats | null>(null);
 
   // Recording & continuous scanning state
   const [isRecording, setIsRecording] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [videoFramesScanned, setVideoFramesScanned] = useState(0);
   const [recordedVideoUrl, setRecordedVideoUrl] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
 
@@ -184,6 +212,7 @@ export function LiveScanner({
   const [manualLat, setManualLat] = useState('37.77493');
   const [manualLng, setManualLng] = useState('-122.41942');
 
+  const viewfinderRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const uploadedVideoRef = useRef<HTMLVideoElement | null>(null);
   const sampleImgRef = useRef<HTMLImageElement | null>(null);
@@ -191,14 +220,22 @@ export function LiveScanner({
   const snapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const stopCameraOnRecorderStopRef = useRef(false);
   const recordedChunksRef = useRef<Blob[]>([]);
-  const scanTimerRef = useRef<number | null>(null);
+  const videoPipelineRef = useRef<VideoStreamDetectionPipeline | null>(null);
   const durationTimerRef = useRef<number | null>(null);
   const consecutiveHitsRef = useRef(0);
   const scanInFlightRef = useRef(false);
   const scanGenerationRef = useRef(0);
   const sessionCapturedRef = useRef<
-    Array<{ lat: number; lng: number; timestamp: number }>
+    Array<{
+      lat: number;
+      lng: number;
+      timestamp: number;
+      videoTimeSec?: number;
+      boxCenterX?: number;
+      boxCenterY?: number;
+    }>
   >([]);
 
   const locationRef = useRef(currentLocation);
@@ -209,27 +246,41 @@ export function LiveScanner({
   open311Ref.current = open311Config;
   const mlParamsRef = useRef(mlParams);
   mlParamsRef.current = mlParams;
+  const videoStreamConfigRef = useRef(videoStreamConfig);
+  videoStreamConfigRef.current = videoStreamConfig;
+  const sourceModeRef = useRef(sourceMode);
+  sourceModeRef.current = sourceMode;
+  const uploadedKindRef = useRef(uploadedKind);
+  uploadedKindRef.current = uploadedKind;
 
-  const stopCameraStream = useCallback(() => {
+  const stopCameraStream = useCallback((resetToIdle = true) => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
     setTorchSupported(false);
     setTorchOn(false);
+    if (resetToIdle) {
+      setCameraStatus('idle');
+    }
   }, []);
 
   const startCamera = useCallback(
-    async (preferredFacing: 'environment' | 'user') => {
+    async (
+      preferredFacing: 'environment' | 'user'
+    ): Promise<MediaStream | null> => {
       if (!navigator.mediaDevices?.getUserMedia) {
         setCameraStatus('error');
         setCameraError(
           'Camera API is unavailable in this browser context. Use Upload Media or Road Samples below.'
         );
-        return;
+        return null;
       }
 
-      stopCameraStream();
+      stopCameraStream(false);
       setCameraStatus('requesting');
       setCameraError(null);
 
@@ -242,17 +293,37 @@ export function LiveScanner({
           },
           audio: false,
         });
+        if (sourceModeRef.current !== 'camera') {
+          stream.getTracks().forEach((track) => track.stop());
+          setCameraStatus('idle');
+          return null;
+        }
         streamRef.current = stream;
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play().catch(() => undefined);
+        const videoEl = videoRef.current;
+        if (videoEl) {
+          videoEl.srcObject = stream;
+          await videoEl.play().catch(() => undefined);
+          if (videoEl.videoWidth === 0) {
+            await new Promise<void>((resolve) => {
+              const onReady = () => {
+                videoEl.removeEventListener('loadedmetadata', onReady);
+                resolve();
+              };
+              videoEl.addEventListener('loadedmetadata', onReady, { once: true });
+              window.setTimeout(() => {
+                videoEl.removeEventListener('loadedmetadata', onReady);
+                resolve();
+              }, 1500);
+            });
+          }
         }
 
         const track = stream.getVideoTracks()[0];
         const caps = track?.getCapabilities?.() as Record<string, unknown> | undefined;
         setTorchSupported(Boolean(caps && 'torch' in caps));
         setCameraStatus('ready');
+        return stream;
       } catch (err: any) {
         setCameraStatus('error');
         setCameraError(
@@ -261,21 +332,21 @@ export function LiveScanner({
             : err?.message ||
                 'Unable to access camera. Switch to Road Samples or Upload Media to test detection.'
         );
+        return null;
       }
     },
     [stopCameraStream]
   );
 
+  // Stop any active camera stream when switching away from camera mode or unmounting
   useEffect(() => {
-    if (sourceMode === 'camera') {
-      startCamera(facingMode);
-    } else {
-      stopCameraStream();
+    if (sourceMode !== 'camera') {
+      stopCameraStream(true);
     }
     return () => {
-      stopCameraStream();
+      stopCameraStream(true);
     };
-  }, [sourceMode, facingMode, startCamera, stopCameraStream]);
+  }, [sourceMode, stopCameraStream]);
 
   useEffect(() => {
     if (!externalImage?.url) return;
@@ -321,10 +392,49 @@ export function LiveScanner({
     return () => {
       active = false;
       unsubscribe();
-      if (scanTimerRef.current) window.clearInterval(scanTimerRef.current);
+      videoPipelineRef.current?.stop(false);
       if (durationTimerRef.current) window.clearInterval(durationTimerRef.current);
     };
   }, []);
+
+  // Align SVG bounding boxes accurately over object-contain uploaded videos (portrait or landscape)
+  useEffect(() => {
+    if (
+      sourceMode !== 'upload' ||
+      uploadedKind !== 'video' ||
+      !uploadedVideoDims
+    ) {
+      setVideoOverlayRect(null);
+      return;
+    }
+    const container = viewfinderRef.current;
+    if (!container) return;
+
+    const updateRect = () => {
+      const cw = container.clientWidth;
+      const ch = container.clientHeight;
+      const { width: mw, height: mh } = uploadedVideoDims;
+      if (!cw || !ch || !mw || !mh) return;
+      const scale = Math.min(cw / mw, ch / mh);
+      const rw = mw * scale;
+      const rh = mh * scale;
+      setVideoOverlayRect({
+        left: (cw - rw) / 2,
+        top: (ch - rh) / 2,
+        width: rw,
+        height: rh,
+      });
+    };
+
+    updateRect();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(updateRect);
+      ro.observe(container);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', updateRect);
+    return () => window.removeEventListener('resize', updateRect);
+  }, [sourceMode, uploadedKind, uploadedVideoDims]);
 
   async function toggleTorch() {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -344,19 +454,27 @@ export function LiveScanner({
     | HTMLVideoElement
     | HTMLImageElement
     | null {
-    if (sourceMode === 'camera' && videoRef.current && videoRef.current.videoWidth > 0) {
+    const mode = sourceModeRef.current;
+    const kind = uploadedKindRef.current;
+    if (
+      mode === 'camera' &&
+      videoRef.current &&
+      videoRef.current.readyState >= 2 &&
+      videoRef.current.videoWidth > 0
+    ) {
       return videoRef.current;
     }
-    if (sourceMode === 'upload') {
+    if (mode === 'upload') {
       if (
-        uploadedKind === 'video' &&
+        kind === 'video' &&
         uploadedVideoRef.current &&
+        uploadedVideoRef.current.readyState >= 2 &&
         uploadedVideoRef.current.videoWidth > 0
       ) {
         return uploadedVideoRef.current;
       }
       if (
-        uploadedKind === 'image' &&
+        kind === 'image' &&
         uploadedImgRef.current &&
         uploadedImgRef.current.naturalWidth > 0
       ) {
@@ -364,7 +482,7 @@ export function LiveScanner({
       }
     }
     if (
-      sourceMode === 'samples' &&
+      mode === 'samples' &&
       sampleImgRef.current &&
       sampleImgRef.current.naturalWidth > 0
     ) {
@@ -376,6 +494,9 @@ export function LiveScanner({
   function captureSnapshotDataUrl(
     sourceEl: HTMLVideoElement | HTMLImageElement
   ): string {
+    if (sourceEl instanceof HTMLVideoElement && sourceEl.readyState < 2) {
+      return '';
+    }
     const canvas = snapshotCanvasRef.current || document.createElement('canvas');
     snapshotCanvasRef.current = canvas;
     const ctx = canvas.getContext('2d');
@@ -404,7 +525,8 @@ export function LiveScanner({
     (
       detection: DetectionResult,
       snapshotDataUrl: string,
-      isStaticSingleScan: boolean
+      isStaticSingleScan: boolean,
+      capturedVideoTimeSec?: number
     ) => {
       if (!detection.potholeDetected || detection.detections.length === 0) return;
 
@@ -413,20 +535,72 @@ export function LiveScanner({
       const lat = loc?.lat ?? geo?.lat ?? 37.77493;
       const lng = loc?.lng ?? geo?.lng ?? -122.41942;
       const nowMs = Date.now();
+      const isUploadedVideo =
+        sourceModeRef.current === 'upload' && uploadedKindRef.current === 'video';
+      const videoTimeSec = isUploadedVideo
+        ? capturedVideoTimeSec ?? uploadedVideoRef.current?.currentTime ?? 0
+        : undefined;
 
-      // Deduplicate during continuous recording if same spot within 12m and < 8s ago
+      let itemsToRecord = detection.detections;
+
       if (!isStaticSingleScan) {
-        const recentSameSpot = sessionCapturedRef.current.some(
-          (entry) =>
-            haversineMeters(entry.lat, entry.lng, lat, lng) < 12 &&
-            nowMs - entry.timestamp < 8000
-        );
-        if (recentSameSpot) return;
+        if (isUploadedVideo && videoTimeSec !== undefined) {
+          // Deduplicate uploaded video detections by video playback timestamp + box proximity
+          itemsToRecord = detection.detections.filter((item) => {
+            const cx = (item.box.xMin + item.box.xMax) / 2;
+            const cy = (item.box.yMin + item.box.yMax) / 2;
+            const isDup = sessionCapturedRef.current.some((entry) => {
+              if (entry.videoTimeSec === undefined) return false;
+              const dt = Math.abs(videoTimeSec - entry.videoTimeSec);
+              if (dt < 0.65) return true;
+              if (
+                dt < 1.6 &&
+                entry.boxCenterX !== undefined &&
+                entry.boxCenterY !== undefined
+              ) {
+                const dist = Math.hypot(
+                  cx - entry.boxCenterX,
+                  cy - entry.boxCenterY
+                );
+                return dist < 240;
+              }
+              return false;
+            });
+            return !isDup;
+          });
+          if (itemsToRecord.length === 0) return;
+        } else {
+          // Live camera: deduplicate same GPS spot within 12m and < 8s ago
+          const recentSameSpot = sessionCapturedRef.current.some(
+            (entry) =>
+              haversineMeters(entry.lat, entry.lng, lat, lng) < 12 &&
+              nowMs - entry.timestamp < 8000
+          );
+          if (recentSameSpot) return;
+        }
       }
 
-      sessionCapturedRef.current.push({ lat, lng, timestamp: nowMs });
+      if (isUploadedVideo && videoTimeSec !== undefined) {
+        for (const item of itemsToRecord) {
+          sessionCapturedRef.current.push({
+            lat,
+            lng,
+            timestamp: nowMs,
+            videoTimeSec,
+            boxCenterX: (item.box.xMin + item.box.xMax) / 2,
+            boxCenterY: (item.box.yMin + item.box.yMax) / 2,
+          });
+        }
+      } else {
+        sessionCapturedRef.current.push({ lat, lng, timestamp: nowMs });
+      }
 
-      const newCandidates: DetectedPotholeCandidate[] = detection.detections.map(
+      const timeTag =
+        videoTimeSec !== undefined
+          ? ` [Video @ ${formatDuration(Math.floor(videoTimeSec))}]`
+          : '';
+
+      const newCandidates: DetectedPotholeCandidate[] = itemsToRecord.map(
         (item, idx) => ({
           candidateId: `cand_${nowMs}_${idx}_${Math.floor(Math.random() * 999)}`,
           detectedAt: new Date().toISOString(),
@@ -434,7 +608,7 @@ export function LiveScanner({
             ...detection,
             overallSeverity: item.severity,
             detections: [item],
-            formalComplaintTitle: `${item.severity} Pothole (${item.estimatedWidthCm} cm × ${item.estimatedDepthCm} cm deep)`,
+            formalComplaintTitle: `${item.severity} Pothole (${item.estimatedWidthCm} cm × ${item.estimatedDepthCm} cm deep)${timeTag}`,
             formalComplaintDescription: `${item.hazardDescription} Estimated depth ${item.depthConfidenceRange} (${item.depthClass}), surface area ~${item.estimatedAreaSqCm} cm².`,
           },
           primaryItem: item,
@@ -497,9 +671,23 @@ export function LiveScanner({
       setScanError(null);
 
       try {
+        const isVideoEl = mediaEl instanceof HTMLVideoElement;
+        const capturedTime =
+          isVideoEl &&
+          sourceModeRef.current === 'upload' &&
+          uploadedKindRef.current === 'video'
+            ? mediaEl.currentTime
+            : undefined;
         const result = await detectPotholesWithRoboflow(
           mediaEl,
-          mlParamsRef.current
+          mlParamsRef.current,
+          isVideoEl
+            ? {
+                isVideoStream: true,
+                maxDimension: videoStreamConfigRef.current.maxDimension,
+                jpegQuality: videoStreamConfigRef.current.jpegQuality,
+              }
+            : undefined
         );
         if (!result || gen !== scanGenerationRef.current) return;
 
@@ -517,8 +705,13 @@ export function LiveScanner({
             consecutiveHitsRef.current >= 2;
 
           if (recordToList && confirmed) {
-            const snap = captureSnapshotDataUrl(mediaEl);
-            addCandidateToReviewList(result.detection, snap, !isContinuousStream);
+            const snap = result.snapshotDataUrl || captureSnapshotDataUrl(mediaEl);
+            addCandidateToReviewList(
+              result.detection,
+              snap,
+              !isContinuousStream,
+              capturedTime
+            );
           }
         } else {
           consecutiveHitsRef.current = 0;
@@ -555,11 +748,149 @@ export function LiveScanner({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mlParams.overlayMode]);
 
-  function startRecordingSession() {
-    if (isRecording) return;
+  function stopContinuousScanLoop() {
+    videoPipelineRef.current?.stop(false);
+    if (durationTimerRef.current) {
+      window.clearInterval(durationTimerRef.current);
+      durationTimerRef.current = null;
+    }
+  }
+
+  function startVideoStreamPipeline(
+    videoEl: HTMLVideoElement,
+    resetStats: boolean
+  ) {
+    stopContinuousScanLoop();
+    if (!videoPipelineRef.current) {
+      videoPipelineRef.current = new VideoStreamDetectionPipeline();
+    }
+
+    const gen = scanGenerationRef.current;
+    videoPipelineRef.current.start(
+      videoEl,
+      {
+        getParams: () => mlParamsRef.current,
+        getConfig: () => videoStreamConfigRef.current,
+        onStats: (stats) => {
+          if (gen !== scanGenerationRef.current) return;
+          setVideoStreamStats(stats);
+          setVideoFramesScanned(stats.framesProcessed);
+        },
+        onResult: (result, stats, videoTimeSec) => {
+          if (gen !== scanGenerationRef.current) return;
+          setLastDetection(result.detection);
+          setMlMetrics(result.metrics);
+          setClusterProfiles(result.clusters);
+          setOverlayDataUrl(result.overlayDataUrl);
+          setLearnedBaseline(getLearnedRoadBaseline());
+          setVideoStreamStats(stats);
+          setVideoFramesScanned(stats.framesProcessed);
+
+          if (result.detection.potholeDetected) {
+            consecutiveHitsRef.current += 1;
+            const confirmed =
+              result.engine === 'roboflow' || consecutiveHitsRef.current >= 2;
+            if (confirmed) {
+              const snap =
+                result.snapshotDataUrl || captureSnapshotDataUrl(videoEl);
+              addCandidateToReviewList(
+                result.detection,
+                snap,
+                false,
+                videoTimeSec
+              );
+            }
+          } else {
+            consecutiveHitsRef.current = 0;
+          }
+        },
+        onStopped: () => {
+          if (durationTimerRef.current) {
+            window.clearInterval(durationTimerRef.current);
+            durationTimerRef.current = null;
+          }
+          setIsRecording(false);
+        },
+      },
+      resetStats
+    );
+
+    durationTimerRef.current = window.setInterval(() => {
+      setRecordingSeconds((s) => s + 1);
+    }, 1000);
+  }
+
+  function handleUploadedVideoPlay() {
+    if (sourceModeRef.current !== 'upload' || uploadedKindRef.current !== 'video') {
+      return;
+    }
+    const vid = uploadedVideoRef.current;
+    if (!vid) return;
+
     setScanError(null);
+    const startingFromBeginning = vid.currentTime < 0.4;
+    if (startingFromBeginning) {
+      sessionCapturedRef.current = [];
+      setVideoFramesScanned(0);
+      setVideoStreamStats(null);
+    }
+    if (!videoPipelineRef.current?.isRunning()) {
+      setIsRecording(true);
+      startVideoStreamPipeline(vid, startingFromBeginning);
+    }
+  }
+
+  function handleUploadedVideoPauseOrEnd() {
+    if (sourceModeRef.current !== 'upload' || uploadedKindRef.current !== 'video') {
+      return;
+    }
+    stopContinuousScanLoop();
+    setIsRecording(false);
+  }
+
+  async function startRecordingSession() {
+    if (isRecording || cameraStatus === 'requesting') return;
+    setScanError(null);
+    stopCameraOnRecorderStopRef.current = false;
+
+    if (sourceMode === 'upload' && uploadedKind === 'video') {
+      const vid = uploadedVideoRef.current;
+      if (!vid) {
+        setScanError('Video player is not ready yet.');
+        return;
+      }
+      const restartFromZero =
+        vid.ended || (vid.duration && vid.currentTime >= vid.duration - 0.15);
+      if (restartFromZero) {
+        vid.currentTime = 0;
+        sessionCapturedRef.current = [];
+        setVideoFramesScanned(0);
+        setVideoStreamStats(null);
+      }
+      setRecordingSeconds(0);
+      setIsRecording(true);
+      try {
+        await vid.play();
+      } catch {
+        // Fallback: start muted if browser autoplay policy requires it
+        vid.muted = true;
+        await vid.play().catch(() => undefined);
+      }
+      if (!videoPipelineRef.current?.isRunning()) {
+        startVideoStreamPipeline(vid, Boolean(restartFromZero) || vid.currentTime < 0.4);
+      }
+      return;
+    }
+
+    if (sourceMode === 'camera' && (cameraStatus !== 'ready' || !streamRef.current)) {
+      const stream = await startCamera(facingMode);
+      if (!stream) return;
+    }
+
     consecutiveHitsRef.current = 0;
     sessionCapturedRef.current = [];
+    setVideoFramesScanned(0);
+    setVideoStreamStats(null);
     setRecordedVideoUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return null;
@@ -569,14 +900,6 @@ export function LiveScanner({
 
     if (gpsStatus !== 'locked') {
       onRetryGps();
-    }
-
-    if (
-      sourceMode === 'upload' &&
-      uploadedKind === 'video' &&
-      uploadedVideoRef.current
-    ) {
-      uploadedVideoRef.current.play().catch(() => undefined);
     }
 
     if (
@@ -599,6 +922,10 @@ export function LiveScanner({
             });
             setRecordedVideoUrl(URL.createObjectURL(blob));
           }
+          if (stopCameraOnRecorderStopRef.current) {
+            stopCameraOnRecorderStopRef.current = false;
+            stopCameraStream(true);
+          }
         };
         recorder.start(1000);
         mediaRecorderRef.current = recorder;
@@ -607,32 +934,25 @@ export function LiveScanner({
       }
     }
 
-    // Only while recording: run real-time Roboflow API detection loop
-    void runDetectionPass(true, true);
-    scanTimerRef.current = window.setInterval(() => {
-      void runDetectionPass(true, true);
-    }, 900);
-
-    durationTimerRef.current = window.setInterval(() => {
-      setRecordingSeconds((s) => s + 1);
-    }, 1000);
+    // Run frame-synchronized downsampled video stream pipeline while recording
+    if (videoRef.current) {
+      startVideoStreamPipeline(videoRef.current, true);
+    }
   }
 
   function stopRecordingSession() {
     setIsRecording(false);
-    if (scanTimerRef.current) {
-      window.clearInterval(scanTimerRef.current);
-      scanTimerRef.current = null;
-    }
-    if (durationTimerRef.current) {
-      window.clearInterval(durationTimerRef.current);
-      durationTimerRef.current = null;
-    }
+    stopContinuousScanLoop();
     if (
       mediaRecorderRef.current &&
       mediaRecorderRef.current.state !== 'inactive'
     ) {
+      if (sourceMode === 'camera') {
+        stopCameraOnRecorderStopRef.current = true;
+      }
       mediaRecorderRef.current.stop();
+    } else if (sourceMode === 'camera') {
+      stopCameraStream(true);
     }
     if (
       sourceMode === 'upload' &&
@@ -830,13 +1150,22 @@ export function LiveScanner({
   function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (isRecording) stopRecordingSession();
     if (uploadedFileUrl && uploadedFileUrl.startsWith('blob:')) {
       URL.revokeObjectURL(uploadedFileUrl);
     }
+    const isVideoFile =
+      file.type.startsWith('video/') ||
+      /\.(mp4|webm|mov|m4v|ogg|ogv|avi|mkv|3gp|3g2)$/i.test(file.name);
     const url = URL.createObjectURL(file);
     setUploadedFileUrl(url);
-    setUploadedKind(file.type.startsWith('video/') ? 'video' : 'image');
+    setUploadedKind(isVideoFile ? 'video' : 'image');
+    setUploadedVideoDims(null);
+    setVideoFramesScanned(0);
+    setVideoStreamStats(null);
+    sessionCapturedRef.current = [];
     clearScanVisuals();
+    e.target.value = '';
   }
 
   const activeSample =
@@ -849,7 +1178,7 @@ export function LiveScanner({
 
   const activeDetections = hasActiveMedia ? lastDetection?.detections || [] : [];
   const canRecord =
-    (sourceMode === 'camera' && cameraStatus === 'ready') ||
+    (sourceMode === 'camera' && cameraStatus !== 'requesting') ||
     (sourceMode === 'upload' && uploadedKind === 'video' && Boolean(uploadedFileUrl));
 
   const pendingCount = detectedList.filter((d) => d.decision === 'pending').length;
@@ -927,7 +1256,10 @@ export function LiveScanner({
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
         {/* Left Column: Viewfinder, Overlays & Recording Controls */}
         <div className="lg:col-span-7 flex flex-col gap-4">
-          <div className="relative rounded-2xl overflow-hidden bg-slate-950 border border-slate-200 aspect-[4/3] sm:aspect-[16/11] w-full flex items-center justify-center">
+          <div
+            ref={viewfinderRef}
+            className="relative rounded-2xl overflow-hidden bg-slate-950 border border-slate-200 aspect-[4/3] sm:aspect-[16/11] w-full flex items-center justify-center"
+          >
             {sourceMode === 'camera' && (
               <>
                 <video
@@ -943,23 +1275,47 @@ export function LiveScanner({
                   <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-900/95 text-white">
                     <Camera className="w-10 h-10 text-amber-400 mb-3" />
                     <h2 className="font-display text-lg font-semibold">
-                      {cameraStatus === 'requesting'
-                        ? 'Requesting Mobile Camera Access...'
-                        : 'Camera Permission Needed'}
+                      {cameraStatus === 'idle'
+                        ? 'Camera Standby'
+                        : cameraStatus === 'requesting'
+                          ? 'Starting Camera...'
+                          : 'Camera Permission Needed'}
                     </h2>
                     <p className="text-sm text-slate-300 mt-1 max-w-sm">
-                      {cameraError ||
-                        'Allow rear camera access when prompted to start recording and detect road potholes automatically.'}
+                      {cameraStatus === 'idle'
+                        ? 'Camera stays off until you tap Start Record. Recording automatically activates live pothole detection and GPS logging.'
+                        : cameraStatus === 'requesting'
+                          ? 'Allow camera access when prompted to begin recording and road hazard scanning.'
+                          : cameraError ||
+                            'Allow camera access when prompted to start recording and detect road potholes.'}
                     </p>
                     <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
-                      <button
-                        type="button"
-                        onClick={() => startCamera(facingMode)}
-                        className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold inline-flex items-center gap-2 cursor-pointer"
-                      >
-                        <RefreshCw className="w-4 h-4" />
-                        Retry Camera
-                      </button>
+                      {cameraStatus !== 'requesting' && (
+                        <button
+                          type="button"
+                          onClick={() => void startRecordingSession()}
+                          className="min-h-[44px] px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold inline-flex items-center gap-2 cursor-pointer transition-colors"
+                        >
+                          <Video className="w-4 h-4" />
+                          {cameraStatus === 'error'
+                            ? 'Retry & Start Record'
+                            : 'Start Record'}
+                        </button>
+                      )}
+                      {cameraStatus === 'idle' && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setFacingMode((f) =>
+                              f === 'environment' ? 'user' : 'environment'
+                            )
+                          }
+                          className="min-h-[44px] px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white text-sm font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          {facingMode === 'environment' ? 'Rear Camera' : 'Front Camera'}
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
@@ -985,6 +1341,24 @@ export function LiveScanner({
                       src={uploadedFileUrl}
                       controls
                       playsInline
+                      preload="auto"
+                      onLoadedMetadata={(e) => {
+                        const v = e.currentTarget;
+                        if (v.videoWidth > 0 && v.videoHeight > 0) {
+                          setUploadedVideoDims({
+                            width: v.videoWidth,
+                            height: v.videoHeight,
+                          });
+                        }
+                      }}
+                      onPlay={handleUploadedVideoPlay}
+                      onPause={handleUploadedVideoPauseOrEnd}
+                      onEnded={handleUploadedVideoPauseOrEnd}
+                      onError={() =>
+                        setScanError(
+                          'Unable to decode this video format in the browser. Please upload an MP4 (H.264) or WebM video.'
+                        )
+                      }
                       className="w-full h-full object-contain bg-black"
                     />
                   ) : (
@@ -1026,62 +1400,75 @@ export function LiveScanner({
               />
             )}
 
-            {/* Pixel-level Road Surface Overlay */}
-            {hasActiveMedia && overlayDataUrl && mlParams.overlayMode !== 'detections' && (
-              <img
-                src={overlayDataUrl}
-                alt="Road surface inspection overlay"
-                className="absolute inset-0 w-full h-full object-cover pointer-events-none"
-                style={{ imageRendering: 'pixelated' }}
-              />
-            )}
+            {/* Pixel-level Road Surface & Bounding Box Overlay (aligned to media rect for videos) */}
+            <div
+              className="absolute pointer-events-none"
+              style={
+                videoOverlayRect
+                  ? {
+                      left: `${videoOverlayRect.left}px`,
+                      top: `${videoOverlayRect.top}px`,
+                      width: `${videoOverlayRect.width}px`,
+                      height: `${videoOverlayRect.height}px`,
+                    }
+                  : { inset: 0 }
+              }
+            >
+              {hasActiveMedia && overlayDataUrl && mlParams.overlayMode !== 'detections' && (
+                <img
+                  src={overlayDataUrl}
+                  alt="Road surface inspection overlay"
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+                  style={{ imageRendering: 'pixelated' }}
+                />
+              )}
 
-            {/* Live Bounding Box Overlay (Visible only when active media is loaded) */}
-            {hasActiveMedia && activeDetections.length > 0 && (
-              <svg
-                viewBox="0 0 1000 1000"
-                preserveAspectRatio="none"
-                className="absolute inset-0 w-full h-full pointer-events-none"
-              >
-                {activeDetections.map((det, idx) => {
-                  const x = Math.max(0, det.box.xMin);
-                  const y = Math.max(0, det.box.yMin);
-                  const w = Math.max(25, det.box.xMax - det.box.xMin);
-                  const h = Math.max(25, det.box.yMax - det.box.yMin);
-                  const color = getSeverityMeta(det.severity).hex;
-                  return (
-                    <g key={idx}>
-                      <rect
-                        x={x}
-                        y={y}
-                        width={w}
-                        height={h}
-                        fill="none"
-                        stroke={color}
-                        strokeWidth="6"
-                      />
-                      <rect
-                        x={x}
-                        y={Math.max(0, y - 44)}
-                        width={Math.min(580, Math.max(280, w))}
-                        height="42"
-                        fill={color}
-                      />
-                      <text
-                        x={x + 12}
-                        y={Math.max(29, y - 14)}
-                        fill="#ffffff"
-                        fontSize="22"
-                        fontFamily="IBM Plex Mono, monospace"
-                        fontWeight="600"
-                      >
-                        {det.severity} · {det.estimatedWidthCm}cm W · {det.estimatedDepthCm}cm D
-                      </text>
-                    </g>
-                  );
-                })}
-              </svg>
-            )}
+              {hasActiveMedia && activeDetections.length > 0 && (
+                <svg
+                  viewBox="0 0 1000 1000"
+                  preserveAspectRatio="none"
+                  className="absolute inset-0 w-full h-full pointer-events-none"
+                >
+                  {activeDetections.map((det, idx) => {
+                    const x = Math.max(0, det.box.xMin);
+                    const y = Math.max(0, det.box.yMin);
+                    const w = Math.max(25, det.box.xMax - det.box.xMin);
+                    const h = Math.max(25, det.box.yMax - det.box.yMin);
+                    const color = getSeverityMeta(det.severity).hex;
+                    return (
+                      <g key={idx}>
+                        <rect
+                          x={x}
+                          y={y}
+                          width={w}
+                          height={h}
+                          fill="none"
+                          stroke={color}
+                          strokeWidth="6"
+                        />
+                        <rect
+                          x={x}
+                          y={Math.max(0, y - 44)}
+                          width={Math.min(580, Math.max(280, w))}
+                          height="42"
+                          fill={color}
+                        />
+                        <text
+                          x={x + 12}
+                          y={Math.max(29, y - 14)}
+                          fill="#ffffff"
+                          fontSize="22"
+                          fontFamily="IBM Plex Mono, monospace"
+                          fontWeight="600"
+                        >
+                          {det.severity} · {det.estimatedWidthCm}cm W · {det.estimatedDepthCm}cm D
+                        </text>
+                      </g>
+                    );
+                  })}
+                </svg>
+              )}
+            </div>
 
             {/* Top Viewfinder HUD */}
             <div className="absolute top-3 left-3 right-3 flex items-center justify-between gap-2 pointer-events-none">
@@ -1089,7 +1476,9 @@ export function LiveScanner({
                 {isRecording && (
                   <div className="px-3 py-1.5 rounded-lg bg-red-600 text-white text-xs font-mono font-semibold flex items-center gap-2 shadow-sm">
                     <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
-                    REC {formatDuration(recordingSeconds)} · ML ACTIVE
+                    {sourceMode === 'upload' && uploadedKind === 'video'
+                      ? `SCANNING · ${videoFramesScanned}f (${videoStreamStats?.framesSkipped ?? 0} skipped · ${videoStreamConfig.maxDimension}px)`
+                      : `REC ${formatDuration(recordingSeconds)} · 1/${videoStreamConfig.frameSkipInterval}f · ${videoStreamConfig.maxDimension}px`}
                   </div>
                 )}
                 {mlMetrics && (
@@ -1115,24 +1504,27 @@ export function LiveScanner({
                       <Flashlight className="w-4 h-4" />
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setFacingMode((f) =>
-                        f === 'environment' ? 'user' : 'environment'
-                      )
-                    }
-                    className="min-h-[40px] px-3 rounded-lg bg-slate-900/75 hover:bg-slate-900 backdrop-blur-sm text-white text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    Flip
-                  </button>
+                  {!isRecording && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next =
+                          facingMode === 'environment' ? 'user' : 'environment';
+                        setFacingMode(next);
+                        void startCamera(next);
+                      }}
+                      className="min-h-[40px] px-3 rounded-lg bg-slate-900/75 hover:bg-slate-900 backdrop-blur-sm text-white text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Flip
+                    </button>
+                  )}
                 </div>
               )}
             </div>
 
-            {/* Bottom GPS Scrim */}
-            {currentLocation && (
+            {/* Bottom GPS Scrim (hidden over uploaded video controls) */}
+            {currentLocation && !(sourceMode === 'upload' && uploadedKind === 'video' && uploadedFileUrl) && (
               <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent px-4 py-3 text-white pointer-events-none">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="font-medium truncate max-w-[70%]">
@@ -1247,6 +1639,49 @@ export function LiveScanner({
                   </div>
                 </div>
 
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-slate-100">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Video Frame-Skip Interval
+                    </label>
+                    <select
+                      value={videoStreamConfig.frameSkipInterval}
+                      onChange={(e) =>
+                        setVideoStreamConfig((prev) => ({
+                          ...prev,
+                          frameSkipInterval: Number(e.target.value),
+                        }))
+                      }
+                      className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
+                    >
+                      <option value={3}>Every 3 frames (High coverage)</option>
+                      <option value={5}>Every 5 frames (Balanced)</option>
+                      <option value={10}>Every 10 frames (Fast)</option>
+                      <option value={15}>Every 15 frames (Low bandwidth)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Video Downsample Resolution
+                    </label>
+                    <select
+                      value={videoStreamConfig.maxDimension}
+                      onChange={(e) =>
+                        setVideoStreamConfig((prev) => ({
+                          ...prev,
+                          maxDimension: Number(e.target.value),
+                        }))
+                      }
+                      className="w-full h-9 px-2.5 rounded-lg border border-slate-300 bg-white text-xs text-slate-900"
+                    >
+                      <option value={480}>480px (Fastest inference)</option>
+                      <option value={640}>640px (Balanced — Recommended)</option>
+                      <option value={800}>800px (Higher detail)</option>
+                    </select>
+                  </div>
+                </div>
+
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100">
                   <div className="text-[11px] text-slate-600">
                     <span className="font-semibold text-slate-800">
@@ -1352,20 +1787,23 @@ export function LiveScanner({
             </div>
           )}
 
-          {/* Recording Control Bar */}
+          {/* Recording / Video Scan Control Bar */}
           <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
             <div className="flex flex-wrap items-center gap-3">
-              {sourceMode === 'camera' ||
-              (sourceMode === 'upload' && uploadedKind === 'video') ? (
+              {sourceMode === 'camera' ? (
                 <>
                   <button
                     type="button"
-                    onClick={startRecordingSession}
+                    onClick={() => void startRecordingSession()}
                     disabled={!canRecord || isRecording}
                     className="flex-1 min-w-[160px] min-h-[48px] px-5 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2 transition-all active:scale-[0.99] bg-amber-600 hover:bg-amber-700 disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed text-white cursor-pointer"
                   >
                     <Video className="w-4 h-4" />
-                    {isRecording ? 'Recording...' : 'Start Recording'}
+                    {isRecording
+                      ? 'Recording...'
+                      : cameraStatus === 'requesting'
+                        ? 'Starting Camera...'
+                        : 'Start Record'}
                   </button>
                   <button
                     type="button"
@@ -1375,6 +1813,44 @@ export function LiveScanner({
                   >
                     <Square className="w-4 h-4 fill-current" />
                     Stop Recording{isRecording ? ` (${detectedList.length})` : ''}
+                  </button>
+                </>
+              ) : sourceMode === 'upload' && uploadedKind === 'video' ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      isRecording
+                        ? stopRecordingSession()
+                        : void startRecordingSession()
+                    }
+                    disabled={!canRecord}
+                    className={`flex-1 min-w-[160px] min-h-[48px] px-5 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2 transition-all active:scale-[0.99] disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed text-white cursor-pointer ${
+                      isRecording
+                        ? 'bg-red-600 hover:bg-red-700'
+                        : 'bg-amber-600 hover:bg-amber-700'
+                    }`}
+                  >
+                    {isRecording ? (
+                      <>
+                        <Pause className="w-4 h-4" />
+                        Pause Video Scan ({videoFramesScanned}f)
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4 fill-current" />
+                        Play &amp; Scan Video
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isScanning || isRecording || !hasActiveMedia}
+                    onClick={() => void runDetectionPass(true, false)}
+                    className="flex-1 min-w-[160px] min-h-[48px] px-5 py-3 rounded-xl font-semibold text-sm inline-flex items-center justify-center gap-2 transition-all active:scale-[0.99] bg-slate-900 hover:bg-slate-800 disabled:bg-slate-100 disabled:text-slate-400 disabled:border disabled:border-slate-200 disabled:cursor-not-allowed text-white cursor-pointer"
+                  >
+                    <Cpu className="w-4 h-4" />
+                    {isScanning ? 'Scanning Frame...' : 'Scan Current Frame'}
                   </button>
                 </>
               ) : (
@@ -1394,9 +1870,13 @@ export function LiveScanner({
 
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600 pt-1 border-t border-slate-100">
               <span>
-                {isRecording
-                  ? 'Scanning road live for potholes, depth, and GPS while recording...'
-                  : 'Camera stays on standby until you tap Start Recording.'}
+                {sourceMode === 'upload' && uploadedKind === 'video'
+                  ? isRecording
+                    ? `Scanning video frames live (${videoFramesScanned} frames analyzed)...`
+                    : 'Press Play on the video or tap Play & Scan Video to detect potholes across all frames, or pause and tap Scan Current Frame.'
+                  : isRecording
+                    ? 'Scanning road live for potholes, depth, and GPS while recording...'
+                    : 'Camera is off. Tap Start Record when you are ready to scan.'}
               </span>
 
               {recordedVideoUrl && (
