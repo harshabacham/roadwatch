@@ -131,6 +131,9 @@ export interface ComplaintRecord {
   autoFiled: boolean;
   imageDataUrl: string;
   detections: PotholeDetectionItem[];
+  isClusterReport?: boolean;
+  clusterCount?: number;
+  clusterRadiusMeters?: number;
   offlineQueued?: boolean;
   queueId?: string;
 }
@@ -180,6 +183,9 @@ export interface PendingComplaintPayload {
   autoRaise: boolean;
   imageDataUrl: string;
   detections: PotholeDetectionItem[];
+  isClusterReport?: boolean;
+  clusterCount?: number;
+  clusterRadiusMeters?: number;
   open311Config: Open311Config;
 }
 

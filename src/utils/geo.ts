@@ -1,4 +1,20 @@
-import { ComplaintRecord, SeverityLevel } from '../types';
+import {
+  ComplaintRecord,
+  DetectedPotholeCandidate,
+  Open311Config,
+  PendingComplaintPayload,
+  SeverityLevel,
+} from '../types';
+
+export const COMPLAINT_CLUSTER_RADIUS_METERS = 5;
+
+const SEVERITY_RANK: Record<string, number> = {
+  None: 0,
+  Low: 1,
+  Moderate: 2,
+  Severe: 3,
+  Critical: 4,
+};
 
 export function haversineMeters(
   lat1: number,
@@ -18,6 +34,153 @@ export function haversineMeters(
       Math.sin(dLng / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
+}
+
+/**
+ * Groups detected pothole candidates within a given radius (default 5m) into
+ * spatial clusters during complaint filing so nearby detections become one
+ * consolidated cluster report rather than duplicate complaints.
+ */
+export function groupCandidatesByRadius(
+  candidates: DetectedPotholeCandidate[],
+  radiusMeters = COMPLAINT_CLUSTER_RADIUS_METERS
+): DetectedPotholeCandidate[][] {
+  const visited = new Array<boolean>(candidates.length).fill(false);
+  const clusters: DetectedPotholeCandidate[][] = [];
+
+  for (let i = 0; i < candidates.length; i++) {
+    if (visited[i]) continue;
+    visited[i] = true;
+    const queue = [i];
+    const cluster: DetectedPotholeCandidate[] = [];
+
+    while (queue.length > 0) {
+      const idx = queue.shift()!;
+      const curr = candidates[idx];
+      cluster.push(curr);
+
+      for (let j = 0; j < candidates.length; j++) {
+        if (visited[j]) continue;
+        const other = candidates[j];
+        if (
+          haversineMeters(curr.lat, curr.lng, other.lat, other.lng) <=
+          radiusMeters
+        ) {
+          visited[j] = true;
+          queue.push(j);
+        }
+      }
+    }
+
+    clusters.push(cluster);
+  }
+
+  return clusters;
+}
+
+export function buildComplaintPayloadFromCluster(
+  cluster: DetectedPotholeCandidate[],
+  open311Config: Open311Config,
+  radiusMeters = COMPLAINT_CLUSTER_RADIUS_METERS
+): PendingComplaintPayload {
+  const primary = cluster[0];
+  if (cluster.length <= 1) {
+    return {
+      title: primary.detection.formalComplaintTitle,
+      description: primary.detection.formalComplaintDescription,
+      severity: primary.primaryItem.severity,
+      confidence: primary.detection.confidence,
+      roadSurfaceType: primary.detection.roadSurfaceType,
+      estimatedDepthCm: primary.primaryItem.estimatedDepthCm,
+      depthClass: primary.primaryItem.depthClass,
+      depthEstimationDetails:
+        primary.primaryItem.depthEstimationDetails || null,
+      lat: primary.lat,
+      lng: primary.lng,
+      accuracyMeters: primary.accuracyMeters,
+      address: primary.address,
+      city: primary.city,
+      state: primary.state,
+      countryCode: primary.countryCode,
+      department: primary.department,
+      portalName: primary.portalName,
+      portalUrl: primary.portalUrl,
+      autoFiled: true,
+      autoRaise: true,
+      imageDataUrl: primary.snapshotDataUrl,
+      detections: [primary.primaryItem],
+      isClusterReport: false,
+      clusterCount: 1,
+      clusterRadiusMeters: radiusMeters,
+      open311Config,
+    };
+  }
+
+  // Pick worst severity / deepest pothole as representative evidence
+  let lead = primary;
+  for (const cand of cluster) {
+    const candRank = SEVERITY_RANK[cand.primaryItem.severity] ?? 0;
+    const leadRank = SEVERITY_RANK[lead.primaryItem.severity] ?? 0;
+    if (
+      candRank > leadRank ||
+      (candRank === leadRank &&
+        cand.primaryItem.estimatedDepthCm > lead.primaryItem.estimatedDepthCm)
+    ) {
+      lead = cand;
+    }
+  }
+
+  const centroidLat =
+    cluster.reduce((sum, c) => sum + c.lat, 0) / cluster.length;
+  const centroidLng =
+    cluster.reduce((sum, c) => sum + c.lng, 0) / cluster.length;
+  const maxWidthCm = Math.max(
+    ...cluster.map((c) => c.primaryItem.estimatedWidthCm)
+  );
+  const maxDepthCm = Math.max(
+    ...cluster.map((c) => c.primaryItem.estimatedDepthCm)
+  );
+  const totalAreaSqCm = cluster.reduce(
+    (sum, c) => sum + c.primaryItem.estimatedAreaSqCm,
+    0
+  );
+  const maxConfidence = Math.max(
+    ...cluster.map((c) => c.detection.confidence)
+  );
+
+  const consolidatedDetections = cluster.map((c, idx) => ({
+    ...c.primaryItem,
+    label: `Cluster Pothole #${idx + 1} (${c.primaryItem.severity})`,
+  }));
+
+  return {
+    title: `Cluster Report (${cluster.length} Potholes within ${radiusMeters}m) — ${lead.primaryItem.severity} Road Defect`,
+    description: `Consolidated cluster complaint grouping ${cluster.length} detected potholes within a ${radiusMeters}-meter radius to prevent duplicate reports. Worst hazard measures approx. ${maxWidthCm} cm wide × ${maxDepthCm} cm deep (${lead.primaryItem.depthClass}), combined damaged area ~${totalAreaSqCm} cm².`,
+    severity: lead.primaryItem.severity,
+    confidence: maxConfidence,
+    roadSurfaceType: lead.detection.roadSurfaceType,
+    estimatedDepthCm: maxDepthCm,
+    depthClass: lead.primaryItem.depthClass,
+    depthEstimationDetails: lead.primaryItem.depthEstimationDetails || null,
+    lat: centroidLat,
+    lng: centroidLng,
+    accuracyMeters: lead.accuracyMeters,
+    address: lead.address,
+    city: lead.city,
+    state: lead.state,
+    countryCode: lead.countryCode,
+    department: lead.department,
+    portalName: lead.portalName,
+    portalUrl: lead.portalUrl,
+    autoFiled: true,
+    autoRaise: true,
+    imageDataUrl: lead.snapshotDataUrl,
+    detections: consolidatedDetections,
+    isClusterReport: true,
+    clusterCount: cluster.length,
+    clusterRadiusMeters: radiusMeters,
+    open311Config,
+  };
 }
 
 export function getSeverityMeta(severity: SeverityLevel | string) {
@@ -101,6 +264,13 @@ export function buildFormattedComplaintText(complaint: ComplaintRecord): string 
     ``,
     `HAZARD SUMMARY`,
     `Title: ${complaint.title}`,
+    ...(complaint.isClusterReport && (complaint.clusterCount || 0) > 1
+      ? [
+          `Cluster Report: ${complaint.clusterCount} potholes grouped within ${
+            complaint.clusterRadiusMeters || COMPLAINT_CLUSTER_RADIUS_METERS
+          }m radius`,
+        ]
+      : []),
     `Severity: ${complaint.severity} (Detection Confidence: ${Math.round(complaint.confidence)}%)`,
     depthLine,
     `Surface Type: ${complaint.roadSurfaceType}`,

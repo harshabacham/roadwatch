@@ -330,6 +330,9 @@ export function pendingQueueItemToComplaintRecord(
     autoFiled: true,
     imageDataUrl: p.imageDataUrl,
     detections: p.detections || [],
+    isClusterReport: p.isClusterReport,
+    clusterCount: p.clusterCount,
+    clusterRadiusMeters: p.clusterRadiusMeters,
     offlineQueued: true,
     queueId: item.queueId,
   };

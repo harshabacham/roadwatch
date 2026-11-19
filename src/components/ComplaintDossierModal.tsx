@@ -128,6 +128,15 @@ export function ComplaintDossierModal({
               <span className={`font-semibold ${severityMeta.textClass}`}>
                 {severityMeta.label}
               </span>
+              {complaint.isClusterReport && (complaint.clusterCount || 0) > 1 && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-semibold text-amber-700">
+                    Cluster ({complaint.clusterCount} potholes in{' '}
+                    {complaint.clusterRadiusMeters || 5}m)
+                  </span>
+                </>
+              )}
             </div>
             <h2
               id="dossier-title"

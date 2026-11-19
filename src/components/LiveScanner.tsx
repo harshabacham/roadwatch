@@ -28,8 +28,11 @@ import {
   Open311Config,
 } from '../types';
 import {
+  buildComplaintPayloadFromCluster,
+  COMPLAINT_CLUSTER_RADIUS_METERS,
   formatDuration,
   getSeverityMeta,
+  groupCandidatesByRadius,
   haversineMeters,
 } from '../utils/geo';
 import {
@@ -45,6 +48,7 @@ import {
   UnsupervisedParams,
 } from '../ml/unsupervisedDetector';
 import {
+  clearFinishedDetections,
   getAllDetectionCandidates,
   pendingQueueItemToComplaintRecord,
   saveDetectionCandidate,
@@ -56,7 +60,14 @@ import {
   subscribeToOfflineSync,
 } from '../offline/syncManager';
 
-import { detectPotholesWithRoboflow } from '../ml/roboflowDetector';
+import {
+  detectPotholesWithRoboflow,
+  type VisualFrameSignature,
+} from '../ml/roboflowDetector';
+import {
+  deduplicateSameFrameDetections,
+  VideoPotholeTracker,
+} from '../ml/videoPotholeTracker';
 import {
   VideoStreamDetectionPipeline,
   type VideoStreamConfig,
@@ -232,11 +243,14 @@ export function LiveScanner({
       lat: number;
       lng: number;
       timestamp: number;
-      videoTimeSec?: number;
-      boxCenterX?: number;
-      boxCenterY?: number;
     }>
   >([]);
+  const videoTrackersByFileRef = useRef<Map<string, VideoPotholeTracker>>(
+    new Map()
+  );
+  const videoTrackerRef = useRef<VideoPotholeTracker>(new VideoPotholeTracker());
+  const cameraTrackerRef = useRef<VideoPotholeTracker>(new VideoPotholeTracker());
+  const cameraSessionStartMsRef = useRef<number>(Date.now());
 
   const locationRef = useRef(currentLocation);
   locationRef.current = currentLocation;
@@ -526,7 +540,9 @@ export function LiveScanner({
       detection: DetectionResult,
       snapshotDataUrl: string,
       isStaticSingleScan: boolean,
-      capturedVideoTimeSec?: number
+      capturedVideoTimeSec?: number,
+      frameSignature?: VisualFrameSignature,
+      cropSignatures?: Float32Array[]
     ) => {
       if (!detection.potholeDetected || detection.detections.length === 0) return;
 
@@ -543,55 +559,40 @@ export function LiveScanner({
 
       let itemsToRecord = detection.detections;
 
-      if (!isStaticSingleScan) {
-        if (isUploadedVideo && videoTimeSec !== undefined) {
-          // Deduplicate uploaded video detections by video playback timestamp + box proximity
-          itemsToRecord = detection.detections.filter((item) => {
-            const cx = (item.box.xMin + item.box.xMax) / 2;
-            const cy = (item.box.yMin + item.box.yMax) / 2;
-            const isDup = sessionCapturedRef.current.some((entry) => {
-              if (entry.videoTimeSec === undefined) return false;
-              const dt = Math.abs(videoTimeSec - entry.videoTimeSec);
-              if (dt < 0.65) return true;
-              if (
-                dt < 1.6 &&
-                entry.boxCenterX !== undefined &&
-                entry.boxCenterY !== undefined
-              ) {
-                const dist = Math.hypot(
-                  cx - entry.boxCenterX,
-                  cy - entry.boxCenterY
-                );
-                return dist < 240;
-              }
-              return false;
-            });
-            return !isDup;
-          });
-          if (itemsToRecord.length === 0) return;
-        } else {
-          // Live camera: deduplicate same GPS spot within 12m and < 8s ago
-          const recentSameSpot = sessionCapturedRef.current.some(
-            (entry) =>
-              haversineMeters(entry.lat, entry.lng, lat, lng) < 12 &&
-              nowMs - entry.timestamp < 8000
-          );
-          if (recentSameSpot) return;
-        }
-      }
-
       if (isUploadedVideo && videoTimeSec !== undefined) {
-        for (const item of itemsToRecord) {
-          sessionCapturedRef.current.push({
-            lat,
-            lng,
-            timestamp: nowMs,
-            videoTimeSec,
-            boxCenterX: (item.box.xMin + item.box.xMax) / 2,
-            boxCenterY: (item.box.yMin + item.box.yMax) / 2,
-          });
-        }
+        // Track physical potholes continuously across video frames & replays using
+        // optical shift, velocity, split-box suppression, and visual crop descriptors
+        itemsToRecord = videoTrackerRef.current.filterNewDetections(
+          detection.detections,
+          videoTimeSec,
+          frameSignature,
+          cropSignatures
+        );
+        if (itemsToRecord.length === 0) return;
+      } else if (sourceModeRef.current === 'camera' && !isStaticSingleScan) {
+        const elapsedSec = (nowMs - cameraSessionStartMsRef.current) / 1000;
+        itemsToRecord = cameraTrackerRef.current.filterNewDetections(
+          detection.detections,
+          elapsedSec,
+          frameSignature,
+          cropSignatures
+        );
+        if (itemsToRecord.length === 0) return;
+
+        // Also guard against GPS-stationary re-logging within 12m & 8s
+        const recentSameSpot = sessionCapturedRef.current.some(
+          (entry) =>
+            haversineMeters(entry.lat, entry.lng, lat, lng) < 12 &&
+            nowMs - entry.timestamp < 8000
+        );
+        if (recentSameSpot) return;
+        sessionCapturedRef.current.push({ lat, lng, timestamp: nowMs });
       } else {
+        itemsToRecord = deduplicateSameFrameDetections(
+          detection.detections,
+          cropSignatures
+        ).items;
+        if (itemsToRecord.length === 0) return;
         sessionCapturedRef.current.push({ lat, lng, timestamp: nowMs });
       }
 
@@ -697,6 +698,15 @@ export function LiveScanner({
         setOverlayDataUrl(result.overlayDataUrl);
         setLearnedBaseline(getLearnedRoadBaseline());
 
+        if (
+          capturedTime !== undefined &&
+          result.frameSignature &&
+          sourceModeRef.current === 'upload' &&
+          uploadedKindRef.current === 'video'
+        ) {
+          videoTrackerRef.current.observeFrame(capturedTime, result.frameSignature);
+        }
+
         if (result.detection.potholeDetected) {
           consecutiveHitsRef.current += 1;
           const confirmed =
@@ -710,7 +720,9 @@ export function LiveScanner({
               result.detection,
               snap,
               !isContinuousStream,
-              capturedTime
+              capturedTime,
+              result.frameSignature,
+              result.cropSignatures
             );
           }
         } else {
@@ -786,6 +798,27 @@ export function LiveScanner({
           setVideoStreamStats(stats);
           setVideoFramesScanned(stats.framesProcessed);
 
+          // Continuously observe frame motion even on zero-detection frames so
+          // active pothole tracks stay locked across blurred/missed video frames
+          if (result.frameSignature) {
+            if (
+              sourceModeRef.current === 'upload' &&
+              uploadedKindRef.current === 'video'
+            ) {
+              videoTrackerRef.current.observeFrame(
+                videoTimeSec,
+                result.frameSignature
+              );
+            } else if (sourceModeRef.current === 'camera') {
+              const elapsedSec =
+                (Date.now() - cameraSessionStartMsRef.current) / 1000;
+              cameraTrackerRef.current.observeFrame(
+                elapsedSec,
+                result.frameSignature
+              );
+            }
+          }
+
           if (result.detection.potholeDetected) {
             consecutiveHitsRef.current += 1;
             const confirmed =
@@ -797,7 +830,9 @@ export function LiveScanner({
                 result.detection,
                 snap,
                 false,
-                videoTimeSec
+                videoTimeSec,
+                result.frameSignature,
+                result.cropSignatures
               );
             }
           } else {
@@ -830,7 +865,6 @@ export function LiveScanner({
     setScanError(null);
     const startingFromBeginning = vid.currentTime < 0.4;
     if (startingFromBeginning) {
-      sessionCapturedRef.current = [];
       setVideoFramesScanned(0);
       setVideoStreamStats(null);
     }
@@ -863,7 +897,6 @@ export function LiveScanner({
         vid.ended || (vid.duration && vid.currentTime >= vid.duration - 0.15);
       if (restartFromZero) {
         vid.currentTime = 0;
-        sessionCapturedRef.current = [];
         setVideoFramesScanned(0);
         setVideoStreamStats(null);
       }
@@ -889,6 +922,8 @@ export function LiveScanner({
 
     consecutiveHitsRef.current = 0;
     sessionCapturedRef.current = [];
+    cameraTrackerRef.current.reset();
+    cameraSessionStartMsRef.current = Date.now();
     setVideoFramesScanned(0);
     setVideoStreamStats(null);
     setRecordedVideoUrl((prev) => {
@@ -963,53 +998,45 @@ export function LiveScanner({
     }
   }
 
-  // Zero-involvement automated government portal dispatch (with IndexedDB offline queueing fallback)
-  async function handleAcceptCandidate(candidate: DetectedPotholeCandidate) {
+  // Zero-involvement automated government portal dispatch with 5m cluster grouping on filing
+  async function submitCandidateCluster(cluster: DetectedPotholeCandidate[]) {
+    if (cluster.length === 0) return;
+    const candidateIds = new Set(cluster.map((c) => c.candidateId));
+    const leadCandidate = cluster[0];
+
     setDetectedList((prev) =>
       prev.map((item) =>
-        item.candidateId === candidate.candidateId
+        candidateIds.has(item.candidateId)
           ? { ...item, decision: 'raising', error: undefined }
           : item
       )
     );
 
-    const payload = {
-      title: candidate.detection.formalComplaintTitle,
-      description: candidate.detection.formalComplaintDescription,
-      severity: candidate.primaryItem.severity,
-      confidence: candidate.detection.confidence,
-      roadSurfaceType: candidate.detection.roadSurfaceType,
-      estimatedDepthCm: candidate.primaryItem.estimatedDepthCm,
-      depthClass: candidate.primaryItem.depthClass,
-      depthEstimationDetails:
-        candidate.primaryItem.depthEstimationDetails || null,
-      lat: candidate.lat,
-      lng: candidate.lng,
-      accuracyMeters: candidate.accuracyMeters,
-      address: candidate.address,
-      city: candidate.city,
-      state: candidate.state,
-      countryCode: candidate.countryCode,
-      department: candidate.department,
-      portalName: candidate.portalName,
-      portalUrl: candidate.portalUrl,
-      autoFiled: true,
-      autoRaise: true,
-      imageDataUrl: candidate.snapshotDataUrl,
-      detections: [candidate.primaryItem],
-      open311Config: open311Ref.current,
-    };
+    const payload = buildComplaintPayloadFromCluster(
+      cluster,
+      open311Ref.current,
+      COMPLAINT_CLUSTER_RADIUS_METERS
+    );
 
     const queueLocally = async () => {
       const queued = await queueComplaintForOfflineSync(
         payload,
-        candidate.candidateId
+        leadCandidate.candidateId
       );
       const offlineRecord = pendingQueueItemToComplaintRecord(queued);
       onComplaintCreated(offlineRecord);
+      await Promise.all(
+        cluster.map((c) =>
+          updateDetectionCandidate(c.candidateId, {
+            decision: 'queued_offline',
+            queuedOfflineId: queued.queueId,
+            error: undefined,
+          })
+        )
+      );
       setDetectedList((prev) =>
         prev.map((item) =>
-          item.candidateId === candidate.candidateId
+          candidateIds.has(item.candidateId)
             ? {
                 ...item,
                 decision: 'queued_offline',
@@ -1028,7 +1055,7 @@ export function LiveScanner({
       } catch (err: any) {
         setDetectedList((prev) =>
           prev.map((item) =>
-            item.candidateId === candidate.candidateId
+            candidateIds.has(item.candidateId)
               ? {
                   ...item,
                   decision: 'pending',
@@ -1060,17 +1087,22 @@ export function LiveScanner({
 
       const raised: ComplaintRecord = data.complaint;
       await upsertCachedComplaint(raised);
-      await updateDetectionCandidate(candidate.candidateId, {
-        decision: 'raised',
-        raisedComplaint: raised,
-        error: undefined,
-      });
+      await Promise.all(
+        cluster.map((c) =>
+          updateDetectionCandidate(c.candidateId, {
+            decision: 'raised',
+            raisedComplaint: raised,
+            error: undefined,
+          })
+        )
+      );
       onComplaintCreated(raised);
 
       setDetectedList((prev) =>
         prev.map((item) =>
-          item.candidateId === candidate.candidateId
-            ? { ...item, decision: 'raised', raisedComplaint: raised }
+          candidateIds.has(item.candidateId) ||
+          item.raisedComplaint?.id === raised.id
+            ? { ...item, decision: 'raised', raisedComplaint: raised, error: undefined }
             : item
         )
       );
@@ -1093,7 +1125,7 @@ export function LiveScanner({
 
       setDetectedList((prev) =>
         prev.map((item) =>
-          item.candidateId === candidate.candidateId
+          candidateIds.has(item.candidateId)
             ? {
                 ...item,
                 decision: 'pending',
@@ -1105,13 +1137,21 @@ export function LiveScanner({
     }
   }
 
+  async function handleAcceptCandidate(candidate: DetectedPotholeCandidate) {
+    await submitCandidateCluster([candidate]);
+  }
+
   async function handleAcceptAllPending() {
     const pendingItems = detectedList.filter((d) => d.decision === 'pending');
     if (pendingItems.length === 0) return;
     setRaisingAll(true);
     try {
-      for (const item of pendingItems) {
-        await handleAcceptCandidate(item);
+      const clusters = groupCandidatesByRadius(
+        pendingItems,
+        COMPLAINT_CLUSTER_RADIUS_METERS
+      );
+      for (const cluster of clusters) {
+        await submitCandidateCluster(cluster);
       }
     } finally {
       setRaisingAll(false);
@@ -1147,6 +1187,17 @@ export function LiveScanner({
     });
   }
 
+  function handleClearReviewed() {
+    setDetectedList((prev) =>
+      prev.filter(
+        (item) => item.decision !== 'raised' && item.decision !== 'rejected'
+      )
+    );
+    void clearFinishedDetections().then(() => {
+      onDetectionsChanged?.();
+    });
+  }
+
   function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1164,6 +1215,17 @@ export function LiveScanner({
     setVideoFramesScanned(0);
     setVideoStreamStats(null);
     sessionCapturedRef.current = [];
+    if (isVideoFile) {
+      const fileKey = `${file.name}:${file.size}:${file.lastModified}`;
+      let existingTracker = videoTrackersByFileRef.current.get(fileKey);
+      if (!existingTracker) {
+        existingTracker = new VideoPotholeTracker();
+        videoTrackersByFileRef.current.set(fileKey, existingTracker);
+      }
+      videoTrackerRef.current = existingTracker;
+    } else {
+      videoTrackerRef.current = new VideoPotholeTracker();
+    }
     clearScanVisuals();
     e.target.value = '';
   }
@@ -1186,6 +1248,9 @@ export function LiveScanner({
     (d) => d.decision === 'queued_offline'
   ).length;
   const raisedCount = detectedList.filter((d) => d.decision === 'raised').length;
+  const finishedCount = detectedList.filter(
+    (d) => d.decision === 'raised' || d.decision === 'rejected'
+  ).length;
 
   return (
     <section className="max-w-7xl mx-auto px-4 sm:px-6 py-5 sm:py-8 space-y-6 pb-24 md:pb-10">
@@ -2157,28 +2222,42 @@ export function LiveScanner({
             </p>
           </div>
 
-          {pendingCount > 0 && (
+          {(pendingCount > 0 || finishedCount > 0) && (
             <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <button
-                type="button"
-                disabled={raisingAll}
-                onClick={handleRejectAllPending}
-                className="min-h-[44px] px-4 py-2 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 disabled:opacity-60 text-red-700 text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
-              >
-                <X className="w-4 h-4" />
-                Reject All ({pendingCount})
-              </button>
-              <button
-                type="button"
-                disabled={raisingAll}
-                onClick={handleAcceptAllPending}
-                className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
-              >
-                <CheckCheck className="w-4 h-4" />
-                {raisingAll
-                  ? 'Submitting Approved...'
-                  : `Approve All (${pendingCount})`}
-              </button>
+              {finishedCount > 0 && (
+                <button
+                  type="button"
+                  disabled={raisingAll}
+                  onClick={handleClearReviewed}
+                  className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 disabled:opacity-60 text-slate-700 text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-1.5 shrink-0 cursor-pointer transition-colors"
+                >
+                  Clear Reviewed ({finishedCount})
+                </button>
+              )}
+              {pendingCount > 0 && (
+                <>
+                  <button
+                    type="button"
+                    disabled={raisingAll}
+                    onClick={handleRejectAllPending}
+                    className="min-h-[44px] px-4 py-2 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 disabled:opacity-60 text-red-700 text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                    Reject All ({pendingCount})
+                  </button>
+                  <button
+                    type="button"
+                    disabled={raisingAll}
+                    onClick={handleAcceptAllPending}
+                    className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
+                  >
+                    <CheckCheck className="w-4 h-4" />
+                    {raisingAll
+                      ? 'Submitting Approved...'
+                      : `Approve All (${pendingCount})`}
+                  </button>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -2350,7 +2429,12 @@ export function LiveScanner({
                         <div className="flex flex-col items-start lg:items-end gap-1.5">
                           <div className="px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-800 inline-flex items-center gap-1.5">
                             <Check className="w-3.5 h-3.5" />
-                            Approved &amp; Filed ·{' '}
+                            {item.raisedComplaint.isClusterReport &&
+                            (item.raisedComplaint.clusterCount || 0) > 1
+                              ? `Clustered (${item.raisedComplaint.clusterCount} in ${
+                                  item.raisedComplaint.clusterRadiusMeters || 5
+                                }m) · `
+                              : 'Approved & Filed · '}
                             <span className="font-mono">
                               {item.raisedComplaint.externalTicketId ||
                                 item.raisedComplaint.trackingCode}

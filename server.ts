@@ -42,6 +42,35 @@ function writeComplaints(records: any[]) {
   fs.writeFileSync(COMPLAINTS_FILE, JSON.stringify(records, null, 2), 'utf-8');
 }
 
+const COMPLAINT_CLUSTER_RADIUS_METERS = 5;
+const SEVERITY_RANK: Record<string, number> = {
+  None: 0,
+  Low: 1,
+  Moderate: 2,
+  Severe: 3,
+  Critical: 4,
+};
+
+function haversineMeters(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number
+): number {
+  const R = 6371000;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
 // Simple in-memory geocode cache
 const geocodeCache = new Map<string, any>();
 
@@ -549,11 +578,143 @@ async function startServer() {
     res.json({ complaints: records });
   });
 
-  // Create & optionally dispatch a complaint to an Open311 / municipal webhook
+  // Create & optionally dispatch a complaint, automatically grouping detections within 5m into a single cluster report
   app.post('/api/complaints', async (req: Request, res: Response) => {
     try {
       const body = req.body || {};
       const now = new Date();
+      const incomingLat = Number(body.lat) || 0;
+      const incomingLng = Number(body.lng) || 0;
+      const incomingDetections = Array.isArray(body.detections)
+        ? body.detections
+        : [];
+      const incomingCount = Math.max(
+        1,
+        Number(body.clusterCount) || incomingDetections.length || 1
+      );
+      const firstDetection = incomingDetections[0] || null;
+      const resolvedDepthCm =
+        body.estimatedDepthCm !== undefined && body.estimatedDepthCm !== null
+          ? Number(body.estimatedDepthCm)
+          : firstDetection?.estimatedDepthCm !== undefined
+          ? Number(firstDetection.estimatedDepthCm)
+          : null;
+
+      // Check existing open complaints within 5-meter radius to avoid duplicate complaints
+      const existingRecords = readComplaints();
+      let matchIdx = -1;
+      let closestDist = Infinity;
+
+      if (Number.isFinite(incomingLat) && Number.isFinite(incomingLng) && (incomingLat !== 0 || incomingLng !== 0)) {
+        for (let i = 0; i < existingRecords.length; i++) {
+          const rec = existingRecords[i];
+          if (!rec || rec.status === 'Resolved') continue;
+          const recLat = Number(rec.lat);
+          const recLng = Number(rec.lng);
+          if (!Number.isFinite(recLat) || !Number.isFinite(recLng)) continue;
+          const dist = haversineMeters(recLat, recLng, incomingLat, incomingLng);
+          if (dist <= COMPLAINT_CLUSTER_RADIUS_METERS && dist < closestDist) {
+            closestDist = dist;
+            matchIdx = i;
+          }
+        }
+      }
+
+      if (matchIdx !== -1) {
+        const target = existingRecords[matchIdx];
+        const prevDetections = Array.isArray(target.detections)
+          ? target.detections
+          : [];
+        const prevCount = Math.max(
+          1,
+          Number(target.clusterCount) || prevDetections.length || 1
+        );
+        const nextClusterCount = prevCount + incomingCount;
+        const mergedDetections = [
+          ...prevDetections,
+          ...incomingDetections.map((det: any, idx: number) => ({
+            ...det,
+            label: `Cluster Pothole #${prevDetections.length + idx + 1} (${det.severity || body.severity || 'Moderate'})`,
+          })),
+        ];
+
+        const prevSevRank = SEVERITY_RANK[target.severity] ?? 0;
+        const newSevRank = SEVERITY_RANK[body.severity] ?? 0;
+        const mergedSeverity =
+          newSevRank > prevSevRank ? body.severity : target.severity || 'Moderate';
+
+        const prevDepth =
+          target.estimatedDepthCm !== null && target.estimatedDepthCm !== undefined
+            ? Number(target.estimatedDepthCm)
+            : null;
+        const useIncomingDepth =
+          resolvedDepthCm !== null &&
+          (prevDepth === null || resolvedDepthCm > prevDepth);
+        const mergedDepthCm = useIncomingDepth ? resolvedDepthCm : prevDepth;
+        const mergedDepthClass = useIncomingDepth
+          ? body.depthClass || firstDetection?.depthClass || target.depthClass || ''
+          : target.depthClass || body.depthClass || '';
+        const mergedDepthDetails = useIncomingDepth
+          ? body.depthEstimationDetails ||
+            firstDetection?.depthEstimationDetails ||
+            target.depthEstimationDetails ||
+            null
+          : target.depthEstimationDetails ||
+            body.depthEstimationDetails ||
+            null;
+
+        const maxWidthCm = mergedDetections.reduce(
+          (max: number, d: any) =>
+            Math.max(max, Number(d?.estimatedWidthCm) || 0),
+          0
+        );
+        const totalAreaSqCm = mergedDetections.reduce(
+          (sum: number, d: any) => sum + (Number(d?.estimatedAreaSqCm) || 0),
+          0
+        );
+
+        const weightedLat =
+          (Number(target.lat) * prevCount + incomingLat * incomingCount) /
+          nextClusterCount;
+        const weightedLng =
+          (Number(target.lng) * prevCount + incomingLng * incomingCount) /
+          nextClusterCount;
+
+        const mergedRecord = {
+          ...target,
+          updatedAt: now.toISOString(),
+          title: `Cluster Report (${nextClusterCount} Potholes within ${COMPLAINT_CLUSTER_RADIUS_METERS}m) — ${mergedSeverity} Road Defect`,
+          description: `Consolidated cluster complaint grouping ${nextClusterCount} detected potholes within a ${COMPLAINT_CLUSTER_RADIUS_METERS}-meter radius to prevent duplicate reports. Worst hazard measures approx. ${maxWidthCm || '—'} cm wide × ${mergedDepthCm ?? '—'} cm deep${mergedDepthClass ? ` (${mergedDepthClass})` : ''}${totalAreaSqCm > 0 ? `, combined damaged area ~${totalAreaSqCm} cm²` : ''}.`,
+          severity: mergedSeverity,
+          confidence: Math.max(
+            Number(target.confidence) || 0,
+            Number(body.confidence) || 0
+          ),
+          estimatedDepthCm: mergedDepthCm,
+          depthClass: mergedDepthClass,
+          depthEstimationDetails: mergedDepthDetails,
+          lat: weightedLat,
+          lng: weightedLng,
+          imageDataUrl:
+            useIncomingDepth && body.imageDataUrl
+              ? body.imageDataUrl
+              : target.imageDataUrl || body.imageDataUrl || '',
+          detections: mergedDetections,
+          isClusterReport: true,
+          clusterCount: nextClusterCount,
+          clusterRadiusMeters: COMPLAINT_CLUSTER_RADIUS_METERS,
+          upstreamResponseNote: `${target.upstreamResponseNote || 'Cluster report active.'} Merged +${incomingCount} nearby detection${incomingCount > 1 ? 's' : ''} (${closestDist.toFixed(1)}m away) into this cluster report.`,
+        };
+
+        existingRecords[matchIdx] = mergedRecord;
+        writeComplaints(existingRecords);
+        return res.status(200).json({
+          complaint: mergedRecord,
+          clustered: true,
+          mergedIntoExisting: true,
+        });
+      }
+
       const year = now.getFullYear();
       const randomNum = Math.floor(1000 + Math.random() * 9000);
       const id = `cmp_${Date.now()}_${randomNum}`;
@@ -584,8 +745,8 @@ async function startServer() {
               form.set('jurisdiction_id', open311.jurisdictionId);
             }
             form.set('service_code', open311.serviceCode || 'pothole');
-            form.set('lat', String(body.lat));
-            form.set('long', String(body.lng));
+            form.set('lat', String(incomingLat));
+            form.set('long', String(incomingLng));
             form.set('address_string', String(body.address || ''));
             form.set(
               'description',
@@ -620,11 +781,11 @@ async function startServer() {
                 title: body.title,
                 description: body.description,
                 severity: body.severity,
-                estimatedDepthCm: body.estimatedDepthCm ?? null,
+                estimatedDepthCm: resolvedDepthCm,
                 depthClass: body.depthClass || '',
                 depthEstimationDetails: body.depthEstimationDetails || null,
-                lat: body.lat,
-                lng: body.lng,
+                lat: incomingLat,
+                lng: incomingLng,
                 address: body.address,
                 city: body.city,
                 state: body.state,
@@ -633,7 +794,10 @@ async function startServer() {
                 portalName: body.portalName,
                 portalUrl: body.portalUrl,
                 detectedAt: now.toISOString(),
-                detections: body.detections || [],
+                detections: incomingDetections,
+                isClusterReport: Boolean(body.isClusterReport || incomingCount > 1),
+                clusterCount: incomingCount,
+                clusterRadiusMeters: COMPLAINT_CLUSTER_RADIUS_METERS,
               }),
               signal: AbortSignal.timeout(8000),
             });
@@ -679,14 +843,7 @@ async function startServer() {
         }
       }
 
-      const firstDetection = Array.isArray(body.detections) ? body.detections[0] : null;
-      const resolvedDepthCm =
-        body.estimatedDepthCm !== undefined && body.estimatedDepthCm !== null
-          ? Number(body.estimatedDepthCm)
-          : firstDetection?.estimatedDepthCm !== undefined
-          ? Number(firstDetection.estimatedDepthCm)
-          : null;
-
+      const isCluster = Boolean(body.isClusterReport || incomingCount > 1);
       const record = {
         id,
         trackingCode,
@@ -703,13 +860,13 @@ async function startServer() {
           body.depthEstimationDetails ||
           firstDetection?.depthEstimationDetails ||
           null,
-        lat: Number(body.lat) || 0,
-        lng: Number(body.lng) || 0,
+        lat: incomingLat,
+        lng: incomingLng,
         accuracyMeters:
           body.accuracyMeters !== undefined && body.accuracyMeters !== null
             ? Number(body.accuracyMeters)
             : null,
-        address: body.address || `${body.lat}, ${body.lng}`,
+        address: body.address || `${incomingLat}, ${incomingLng}`,
         city: body.city || '',
         state: body.state || '',
         countryCode: body.countryCode || '',
@@ -723,14 +880,20 @@ async function startServer() {
         upstreamResponseNote,
         autoFiled: Boolean(body.autoFiled),
         imageDataUrl: body.imageDataUrl || '',
-        detections: Array.isArray(body.detections) ? body.detections : [],
+        detections: incomingDetections,
+        isClusterReport: isCluster,
+        clusterCount: incomingCount,
+        clusterRadiusMeters: COMPLAINT_CLUSTER_RADIUS_METERS,
       };
 
-      const existing = readComplaints();
-      const updated = [record, ...existing];
+      const updated = [record, ...existingRecords];
       writeComplaints(updated);
 
-      return res.status(201).json({ complaint: record });
+      return res.status(201).json({
+        complaint: record,
+        clustered: isCluster,
+        mergedIntoExisting: false,
+      });
     } catch (err: any) {
       return res
         .status(500)

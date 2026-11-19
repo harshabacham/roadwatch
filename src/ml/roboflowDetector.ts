@@ -52,6 +52,93 @@ export interface DownsampledFrameInfo {
   sourceHeight: number;
 }
 
+export interface VisualFrameSignature {
+  width: number;
+  height: number;
+  /** Zero-mean unit-norm downsampled luminance grid for fast optical-shift & scene matching. */
+  data: Float32Array;
+}
+
+function buildNormalizedGrid(
+  luminance: Float32Array,
+  srcW: number,
+  srcH: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  gridW: number,
+  gridH: number
+): Float32Array {
+  const out = new Float32Array(gridW * gridH);
+  const roiW = Math.max(1, x1 - x0);
+  const roiH = Math.max(1, y1 - y0);
+  let mean = 0;
+
+  for (let gy = 0; gy < gridH; gy++) {
+    const sy0 = Math.min(srcH - 1, Math.max(0, Math.floor(y0 + (gy / gridH) * roiH)));
+    const sy1 = Math.min(srcH, Math.max(sy0 + 1, Math.floor(y0 + ((gy + 1) / gridH) * roiH)));
+    for (let gx = 0; gx < gridW; gx++) {
+      const sx0 = Math.min(srcW - 1, Math.max(0, Math.floor(x0 + (gx / gridW) * roiW)));
+      const sx1 = Math.min(srcW, Math.max(sx0 + 1, Math.floor(x0 + ((gx + 1) / gridW) * roiW)));
+      let sum = 0;
+      let cnt = 0;
+      for (let y = sy0; y < sy1; y++) {
+        const row = y * srcW;
+        for (let x = sx0; x < sx1; x++) {
+          sum += luminance[row + x];
+          cnt++;
+        }
+      }
+      const val = cnt > 0 ? sum / cnt : 0;
+      out[gy * gridW + gx] = val;
+      mean += val;
+    }
+  }
+
+  mean /= out.length;
+  let normSq = 0;
+  for (let i = 0; i < out.length; i++) {
+    const centered = out[i] - mean;
+    out[i] = centered;
+    normSq += centered * centered;
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm > 1e-5) {
+    for (let i = 0; i < out.length; i++) {
+      out[i] /= norm;
+    }
+  }
+  return out;
+}
+
+function computeFrameVisualSignature(
+  luminance: Float32Array,
+  srcW: number,
+  srcH: number
+): VisualFrameSignature {
+  const width = 24;
+  const height = 18;
+  return {
+    width,
+    height,
+    data: buildNormalizedGrid(luminance, srcW, srcH, 0, 0, srcW, srcH, width, height),
+  };
+}
+
+function computeCropVisualSignature(
+  luminance: Float32Array,
+  srcW: number,
+  srcH: number,
+  box: BoundingBox
+): Float32Array {
+  const x0 = Math.max(0, Math.min(srcW - 1, Math.floor((box.xMin / 1000) * srcW)));
+  const y0 = Math.max(0, Math.min(srcH - 1, Math.floor((box.yMin / 1000) * srcH)));
+  const x1 = Math.max(x0 + 1, Math.min(srcW, Math.ceil((box.xMax / 1000) * srcW)));
+  const y1 = Math.max(y0 + 1, Math.min(srcH, Math.ceil((box.yMax / 1000) * srcH)));
+  return buildNormalizedGrid(luminance, srcW, srcH, x0, y0, x1, y1, 8, 8);
+}
+
 let reusableCaptureCanvas: HTMLCanvasElement | null = null;
 let reusableAnalysisCanvas: HTMLCanvasElement | null = null;
 
@@ -235,6 +322,10 @@ export interface RoboflowDetectionOutput extends UnsupervisedAnalysisOutput {
   /** Exact downsampled frame snapshot captured at inference time (prevents motion drift on video streams). */
   snapshotDataUrl: string;
   downsampledSize: DownsampledFrameInfo;
+  /** Lightweight visual signature of the analyzed frame for camera-motion & duplicate tracking. */
+  frameSignature?: VisualFrameSignature;
+  /** Per-detection visual crop descriptors aligned with detection.detections indices. */
+  cropSignatures?: Float32Array[];
 }
 
 /**
@@ -262,6 +353,9 @@ export async function detectPotholesWithRoboflow(
 
   // Compute surface features & optional diagnostic overlay on the exact frozen frame BEFORE async fetch
   const surface = extractFrameLuminanceAndGradient(frame.canvas);
+  const frameSignature = surface
+    ? computeFrameVisualSignature(surface.luminance, ANALYSIS_W, ANALYSIS_H)
+    : undefined;
   const localOverlayPass =
     params.overlayMode !== 'detections'
       ? analyzeFrameUnsupervised(frame.canvas, params)
@@ -271,12 +365,19 @@ export async function detectPotholesWithRoboflow(
     const offline =
       localOverlayPass || analyzeFrameUnsupervised(frame.canvas, params);
     if (!offline) return null;
+    const offlineCrops = surface
+      ? offline.detection.detections.map((d) =>
+          computeCropVisualSignature(surface.luminance, ANALYSIS_W, ANALYSIS_H, d.box)
+        )
+      : undefined;
     return {
       ...offline,
       engine: 'offline-fallback',
       modelId: 'offline-local-cv',
       snapshotDataUrl: frame.dataUrl,
       downsampledSize,
+      frameSignature,
+      cropSignatures: offlineCrops,
     };
   }
 
@@ -555,6 +656,12 @@ export async function detectPotholesWithRoboflow(
         : []),
     ];
 
+    const cropSignatures = surface
+      ? detections.map((d) =>
+          computeCropVisualSignature(surface.luminance, ANALYSIS_W, ANALYSIS_H, d.box)
+        )
+      : undefined;
+
     return {
       detection,
       metrics,
@@ -564,18 +671,27 @@ export async function detectPotholesWithRoboflow(
       modelId: payload.modelId || 'pothole-detection-bqu6s-dwjbo/1',
       snapshotDataUrl: frame.dataUrl,
       downsampledSize,
+      frameSignature,
+      cropSignatures,
     };
   } catch (err) {
     console.warn('Roboflow inference failed, falling back to offline detector:', err);
     const offline =
       localOverlayPass || analyzeFrameUnsupervised(frame.canvas, params);
     if (!offline) return null;
+    const offlineCrops = surface
+      ? offline.detection.detections.map((d) =>
+          computeCropVisualSignature(surface.luminance, ANALYSIS_W, ANALYSIS_H, d.box)
+        )
+      : undefined;
     return {
       ...offline,
       engine: 'offline-fallback',
       modelId: 'offline-local-cv',
       snapshotDataUrl: frame.dataUrl,
       downsampledSize,
+      frameSignature,
+      cropSignatures: offlineCrops,
     };
   }
 }

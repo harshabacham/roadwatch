@@ -225,6 +225,12 @@ export function ComplaintLog({
                             <div className="text-xs text-slate-500 truncate">
                               {item.address}
                             </div>
+                            {item.isClusterReport && (item.clusterCount || 0) > 1 && (
+                              <div className="text-[11px] font-semibold text-amber-700 mt-0.5">
+                                Cluster Report · {item.clusterCount} potholes within{' '}
+                                {item.clusterRadiusMeters || 5}m
+                              </div>
+                            )}
                           </div>
                         </div>
                       </td>
@@ -326,6 +332,12 @@ export function ComplaintLog({
                     <div className="text-xs text-slate-500 truncate mt-0.5">
                       {item.address}
                     </div>
+                    {item.isClusterReport && (item.clusterCount || 0) > 1 && (
+                      <div className="text-[11px] font-semibold text-amber-700 mt-0.5">
+                        Cluster Report · {item.clusterCount} potholes within{' '}
+                        {item.clusterRadiusMeters || 5}m
+                      </div>
+                    )}
                   </div>
 
                   <ChevronRight className="w-5 h-5 text-slate-400 shrink-0" />
