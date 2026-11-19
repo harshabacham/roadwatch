@@ -54,9 +54,13 @@ import {
   subscribeToOfflineSync,
 } from '../offline/syncManager';
 
+import { detectPotholesWithRoboflow } from '../ml/roboflowDetector';
 import severeSampleUrl from '../assets/images/road_sample_severe_1795005146352.jpg';
 import moderateSampleUrl from '../assets/images/road_sample_moderate_1795005146362.jpg';
 import waterloggedSampleUrl from '../assets/images/road_sample_waterlogged_1795005147911.jpg';
+import highwaySampleUrl from '../assets/images/road_sample_highway_pothole_1795023499964.jpg';
+import residentialSampleUrl from '../assets/images/road_sample_residential_crack_1795023503887.jpg';
+import cleanAsphaltSampleUrl from '../assets/images/road_sample_clean_asphalt_1795023504230.jpg';
 
 type SourceMode = 'camera' | 'upload' | 'samples';
 
@@ -68,16 +72,34 @@ const ROAD_SAMPLES = [
     url: severeSampleUrl,
   },
   {
+    id: 'highway',
+    label: 'Highway Lane Pothole',
+    subtitle: 'Sharp-edged broken crater',
+    url: highwaySampleUrl,
+  },
+  {
     id: 'moderate',
     label: 'Avenue Lane Hazards',
     subtitle: 'Multiple cracks & cavities',
     url: moderateSampleUrl,
   },
   {
+    id: 'residential',
+    label: 'Residential Curb Hole',
+    subtitle: 'Crumbling curb pavement',
+    url: residentialSampleUrl,
+  },
+  {
     id: 'waterlogged',
     label: 'Waterlogged Curb Hole',
     subtitle: 'Rain-filled edge collapse',
     url: waterloggedSampleUrl,
+  },
+  {
+    id: 'clean',
+    label: 'Clean Asphalt Road',
+    subtitle: 'Intact road (0 hazards)',
+    url: cleanAsphaltSampleUrl,
   },
 ];
 
@@ -142,11 +164,12 @@ export function LiveScanner({
 
   // Recording & continuous scanning state
   const [isRecording, setIsRecording] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [recordedVideoUrl, setRecordedVideoUrl] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
 
-  // Live Unsupervised ML telemetry & Detected Potholes List for User Acceptance
+  // Live Detection telemetry & Detected Potholes List for User Acceptance
   const [lastDetection, setLastDetection] = useState<DetectionResult | null>(null);
   const [mlMetrics, setMlMetrics] = useState<UnsupervisedMetrics | null>(null);
   const [clusterProfiles, setClusterProfiles] = useState<ClusterProfile[]>([]);
@@ -170,6 +193,8 @@ export function LiveScanner({
   const scanTimerRef = useRef<number | null>(null);
   const durationTimerRef = useRef<number | null>(null);
   const consecutiveHitsRef = useRef(0);
+  const scanInFlightRef = useRef(false);
+  const scanGenerationRef = useRef(0);
   const sessionCapturedRef = useRef<
     Array<{ lat: number; lng: number; timestamp: number }>
   >([]);
@@ -424,11 +449,24 @@ export function LiveScanner({
     [onDetectionsChanged]
   );
 
-  const runUnsupervisedPass = useCallback(
-    (recordToList: boolean, requireTemporalStability: boolean) => {
+  const clearScanVisuals = useCallback(() => {
+    scanGenerationRef.current += 1;
+    scanInFlightRef.current = false;
+    consecutiveHitsRef.current = 0;
+    setIsScanning(false);
+    setLastDetection(null);
+    setMlMetrics(null);
+    setClusterProfiles([]);
+    setOverlayDataUrl('');
+    setScanError(null);
+  }, []);
+
+  const runDetectionPass = useCallback(
+    async (recordToList: boolean, isContinuousStream: boolean) => {
+      if (scanInFlightRef.current) return;
       const mediaEl = getActiveMediaElement();
       if (!mediaEl) {
-        if (!requireTemporalStability) {
+        if (!isContinuousStream) {
           setScanError(
             'Media not ready yet. Wait for camera or road image to finish loading.'
           );
@@ -436,48 +474,69 @@ export function LiveScanner({
         return;
       }
 
+      const gen = scanGenerationRef.current;
+      scanInFlightRef.current = true;
+      if (!isContinuousStream) setIsScanning(true);
       setScanError(null);
-      const result = analyzeFrameUnsupervised(mediaEl, mlParamsRef.current);
-      if (!result) return;
 
-      setLastDetection(result.detection);
-      setMlMetrics(result.metrics);
-      setClusterProfiles(result.clusters);
-      setOverlayDataUrl(result.overlayDataUrl);
-      setLearnedBaseline(getLearnedRoadBaseline());
+      try {
+        const result = await detectPotholesWithRoboflow(
+          mediaEl,
+          mlParamsRef.current
+        );
+        if (!result || gen !== scanGenerationRef.current) return;
 
-      if (result.detection.potholeDetected) {
-        consecutiveHitsRef.current += 1;
-        const confirmed =
-          !requireTemporalStability || consecutiveHitsRef.current >= 2;
+        setLastDetection(result.detection);
+        setMlMetrics(result.metrics);
+        setClusterProfiles(result.clusters);
+        setOverlayDataUrl(result.overlayDataUrl);
+        setLearnedBaseline(getLearnedRoadBaseline());
 
-        if (recordToList && confirmed) {
-          const snap = captureSnapshotDataUrl(mediaEl);
-          addCandidateToReviewList(result.detection, snap, !requireTemporalStability);
+        if (result.detection.potholeDetected) {
+          consecutiveHitsRef.current += 1;
+          const confirmed =
+            !isContinuousStream ||
+            result.engine === 'roboflow' ||
+            consecutiveHitsRef.current >= 2;
+
+          if (recordToList && confirmed) {
+            const snap = captureSnapshotDataUrl(mediaEl);
+            addCandidateToReviewList(result.detection, snap, !isContinuousStream);
+          }
+        } else {
+          consecutiveHitsRef.current = 0;
         }
-      } else {
-        consecutiveHitsRef.current = 0;
+      } catch (err: any) {
+        if (gen === scanGenerationRef.current && !isContinuousStream) {
+          setScanError(err?.message || 'Pothole detection request failed.');
+        }
+      } finally {
+        scanInFlightRef.current = false;
+        if (gen === scanGenerationRef.current) {
+          setIsScanning(false);
+        }
       }
     },
     [sourceMode, uploadedKind, addCandidateToReviewList]
   );
 
-  // Recompute overlay visualization when user switches diagnostic mode on static sample/image
+  // Recompute pixel overlay visualization when user switches overlay mode on static sample/image
   useEffect(() => {
     if (!isRecording && lastDetection) {
       const mediaEl = getActiveMediaElement();
-      if (mediaEl) {
-        const updated = analyzeFrameUnsupervised(mediaEl, mlParams);
-        if (updated) {
-          setLastDetection(updated.detection);
-          setMlMetrics(updated.metrics);
-          setClusterProfiles(updated.clusters);
-          setOverlayDataUrl(updated.overlayDataUrl);
-        }
+      if (!mediaEl) return;
+      if (mlParams.overlayMode === 'detections') {
+        setOverlayDataUrl('');
+        return;
+      }
+      const updated = analyzeFrameUnsupervised(mediaEl, mlParams);
+      if (updated) {
+        setOverlayDataUrl(updated.overlayDataUrl);
+        setClusterProfiles(updated.clusters);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mlParams]);
+  }, [mlParams.overlayMode]);
 
   function startRecordingSession() {
     if (isRecording) return;
@@ -531,11 +590,11 @@ export function LiveScanner({
       }
     }
 
-    // Only while recording: run real-time ~3.3 FPS Unsupervised ML detection loop
-    runUnsupervisedPass(true, true);
+    // Only while recording: run real-time Roboflow API detection loop
+    void runDetectionPass(true, true);
     scanTimerRef.current = window.setInterval(() => {
-      runUnsupervisedPass(true, true);
-    }, 300);
+      void runDetectionPass(true, true);
+    }, 900);
 
     durationTimerRef.current = window.setInterval(() => {
       setRecordingSeconds((s) => s + 1);
@@ -738,15 +797,18 @@ export function LiveScanner({
     const url = URL.createObjectURL(file);
     setUploadedFileUrl(url);
     setUploadedKind(file.type.startsWith('video/') ? 'video' : 'image');
-    setLastDetection(null);
-    setMlMetrics(null);
-    setOverlayDataUrl('');
+    clearScanVisuals();
   }
 
   const activeSample =
     ROAD_SAMPLES.find((s) => s.id === selectedSampleId) || ROAD_SAMPLES[0];
 
-  const activeDetections = lastDetection?.detections || [];
+  const hasActiveMedia =
+    (sourceMode === 'camera' && cameraStatus === 'ready') ||
+    (sourceMode === 'upload' && Boolean(uploadedFileUrl)) ||
+    sourceMode === 'samples';
+
+  const activeDetections = hasActiveMedia ? lastDetection?.detections || [] : [];
   const canRecord =
     (sourceMode === 'camera' && cameraStatus === 'ready') ||
     (sourceMode === 'upload' && uploadedKind === 'video' && Boolean(uploadedFileUrl));
@@ -775,6 +837,7 @@ export function LiveScanner({
             type="button"
             onClick={() => {
               if (isRecording) stopRecordingSession();
+              clearScanVisuals();
               setSourceMode('camera');
             }}
             className={`min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer transition-colors ${
@@ -790,6 +853,7 @@ export function LiveScanner({
             type="button"
             onClick={() => {
               if (isRecording) stopRecordingSession();
+              clearScanVisuals();
               setSourceMode('upload');
             }}
             className={`min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer transition-colors ${
@@ -805,6 +869,7 @@ export function LiveScanner({
             type="button"
             onClick={() => {
               if (isRecording) stopRecordingSession();
+              clearScanVisuals();
               setSourceMode('samples');
             }}
             className={`min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer transition-colors ${
@@ -858,7 +923,10 @@ export function LiveScanner({
                       </button>
                       <button
                         type="button"
-                        onClick={() => setSourceMode('samples')}
+                        onClick={() => {
+                          clearScanVisuals();
+                          setSourceMode('samples');
+                        }}
                         className="min-h-[44px] px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white text-sm font-medium cursor-pointer"
                       >
                         Test Road Samples
@@ -920,7 +988,7 @@ export function LiveScanner({
             )}
 
             {/* Pixel-level Road Surface Overlay */}
-            {overlayDataUrl && mlParams.overlayMode !== 'detections' && (
+            {hasActiveMedia && overlayDataUrl && mlParams.overlayMode !== 'detections' && (
               <img
                 src={overlayDataUrl}
                 alt="Road surface inspection overlay"
@@ -929,8 +997,8 @@ export function LiveScanner({
               />
             )}
 
-            {/* Live Bounding Box Overlay (Visible while recording or after sample scan) */}
-            {activeDetections.length > 0 && (
+            {/* Live Bounding Box Overlay (Visible only when active media is loaded) */}
+            {hasActiveMedia && activeDetections.length > 0 && (
               <svg
                 viewBox="0 0 1000 1000"
                 preserveAspectRatio="none"
@@ -1193,7 +1261,7 @@ export function LiveScanner({
           </div>
 
           {sourceMode === 'samples' && (
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
               {ROAD_SAMPLES.map((sample) => {
                 const selected = sample.id === selectedSampleId;
                 return (
@@ -1202,7 +1270,7 @@ export function LiveScanner({
                     type="button"
                     onClick={() => {
                       setSelectedSampleId(sample.id);
-                      setLastDetection(null);
+                      clearScanVisuals();
                     }}
                     className={`text-left p-2 rounded-xl border transition-all cursor-pointer ${
                       selected
@@ -1273,11 +1341,14 @@ export function LiveScanner({
               ) : (
                 <button
                   type="button"
-                  onClick={() => runUnsupervisedPass(true, false)}
-                  className="flex-1 min-h-[48px] px-5 py-3 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                  disabled={isScanning || !hasActiveMedia}
+                  onClick={() => void runDetectionPass(true, false)}
+                  className="flex-1 min-h-[48px] px-5 py-3 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-sm font-semibold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors"
                 >
                   <Cpu className="w-4 h-4" />
-                  Detect Potholes &amp; Add to Review List
+                  {isScanning
+                    ? 'Detecting Potholes...'
+                    : 'Detect Potholes & Add to Review List'}
                 </button>
               )}
             </div>

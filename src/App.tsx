@@ -4,9 +4,11 @@ import { LiveScanner } from './components/LiveScanner';
 import { HazardMap } from './components/HazardMap';
 import { ComplaintLog } from './components/ComplaintLog';
 import { PortalSettings } from './components/PortalSettings';
+import { MLTrainingPanel } from './components/MLTrainingPanel';
 import { ComplaintDossierModal } from './components/ComplaintDossierModal';
 import { OfflineSyncBar } from './components/OfflineSyncBar';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { setTrainedClassifierModel } from './ml/unsupervisedDetector';
 import {
   cacheServerComplaints,
   getCachedComplaints,
@@ -26,6 +28,7 @@ import {
   GeocodedLocation,
   OfflineQueueStats,
   Open311Config,
+  TrainedPotholeModel,
 } from './types';
 import { haversineMeters } from './utils/geo';
 
@@ -79,6 +82,9 @@ export default function App() {
   });
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncNotice, setLastSyncNotice] = useState<string | null>(null);
+  const [trainedModel, setTrainedModel] = useState<TrainedPotholeModel | null>(
+    null
+  );
 
   const lastGeocodedCoordsRef = useRef<{ lat: number; lng: number } | null>(
     null
@@ -194,11 +200,25 @@ export default function App() {
     }
   }, [refreshQueueStats]);
 
-  // Initialize Service Worker, GPS, and IndexedDB-backed complaints on mount
+  // Initialize Service Worker, GPS, trained ML model, and IndexedDB-backed complaints on mount
   useEffect(() => {
     initOfflineSync();
     startGpsWatch();
     void loadComplaintsAndQueue();
+    void (async () => {
+      try {
+        const res = await fetch('/api/ml/model');
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.model) {
+            setTrainedModel(data.model);
+            setTrainedClassifierModel(data.model);
+          }
+        }
+      } catch {
+        // Offline fallback uses unsupervised detector defaults
+      }
+    })();
 
     const unsubscribe = subscribeToOfflineSync((event) => {
       if (event.type === 'QUEUE_UPDATED') {
@@ -367,6 +387,16 @@ export default function App() {
             loading={loadingComplaints}
             onSelectComplaint={(c) => setSelectedComplaint(c)}
             onOpenScanner={() => setActiveTab('scanner')}
+          />
+        )}
+
+        {activeTab === 'training' && (
+          <MLTrainingPanel
+            model={trainedModel}
+            onModelUpdated={(nextModel) => {
+              setTrainedModel(nextModel);
+              setTrainedClassifierModel(nextModel);
+            }}
           />
         )}
 

@@ -30,6 +30,7 @@ export interface PotholeDetectionItem {
   mahalanobisZ: number;
   luminanceDropPct: number;
   roughnessScorePct: number;
+  classifierProbability?: number;
   hazardDescription: string;
   box: BoundingBox;
 }
@@ -197,4 +198,65 @@ export interface OfflineQueueStats {
   pendingComplaintsCount: number;
   cachedComplaintsCount: number;
 }
+
+export type DatasetLabel = 'pothole' | 'no_pothole';
+
+export type DatasetCategory =
+  | 'pothole_cavity'
+  | 'waterlogged_pothole'
+  | 'alligator_cracking'
+  | 'clean_road'
+  | 'lane_marking'
+  | 'shadow'
+  | 'tar_joint'
+  | 'wet_glare'
+  | 'user_feedback';
+
+export interface LabeledDatasetSample {
+  id: string;
+  label: DatasetLabel;
+  category: DatasetCategory;
+  title: string;
+  sourceType: 'asset' | 'synthetic' | 'upload' | 'feedback';
+  assetPath?: string;
+  syntheticKind?: string;
+  imageDataUrl?: string;
+  createdAt: string;
+}
+
+export interface ModelEvaluationMetrics {
+  accuracy: number;
+  precision: number;
+  recall: number;
+  f1Score: number;
+  f05Score: number;
+  falsePositiveRate: number;
+  rocAuc: number;
+  truePositives: number;
+  falsePositives: number;
+  trueNegatives: number;
+  falseNegatives: number;
+  datasetSamples: number;
+  positiveSamples: number;
+  negativeSamples: number;
+  candidateRegionsEvaluated: number;
+  positiveRegions: number;
+  hardNegativeRegions: number;
+  trainingEpochs: number;
+}
+
+export interface TrainedPotholeModel {
+  version: number;
+  trainedAt: string;
+  algorithm: string;
+  featureNames: string[];
+  featureMeans: number[];
+  featureStds: number[];
+  weights: number[];
+  bias: number;
+  decisionThreshold: number;
+  falsePositivePenalty: number;
+  metrics: ModelEvaluationMetrics;
+}
+
 

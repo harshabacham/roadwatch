@@ -226,6 +226,95 @@ async function startServer() {
     res.json({ ok: true, timestamp: new Date().toISOString() });
   });
 
+  // Server-side Roboflow Serverless Inference proxy (header-based API key auth)
+  app.post('/api/detect/roboflow', async (req: Request, res: Response) => {
+    try {
+      const apiUrl = (
+        process.env.ROBOFLOW_API_URL || 'https://serverless.roboflow.com'
+      ).replace(/\/+$/, '');
+      const modelId = (
+        process.env.ROBOFLOW_MODEL_ID || 'pothole-detection-bqu6s-dwjbo/1'
+      ).replace(/^\/+/, '');
+      const apiKey = (process.env.ROBOFLOW_API_KEY || '').trim();
+
+      if (!apiKey) {
+        return res.status(503).json({
+          error: 'ROBOFLOW_API_KEY is not configured on the server.',
+        });
+      }
+
+      const { imageDataUrl, imageBase64, confidence, overlap } = req.body || {};
+      let rawBase64 = '';
+      if (typeof imageBase64 === 'string' && imageBase64.trim()) {
+        rawBase64 = imageBase64.trim();
+      } else if (typeof imageDataUrl === 'string' && imageDataUrl.trim()) {
+        const commaIdx = imageDataUrl.indexOf(',');
+        rawBase64 =
+          commaIdx >= 0
+            ? imageDataUrl.slice(commaIdx + 1).trim()
+            : imageDataUrl.trim();
+      }
+
+      if (!rawBase64) {
+        return res.status(400).json({
+          error: 'imageDataUrl or imageBase64 is required.',
+        });
+      }
+
+      const params = new URLSearchParams();
+      if (Number.isFinite(Number(confidence))) {
+        const confVal = Math.max(0.05, Math.min(0.99, Number(confidence)));
+        params.set('confidence', confVal.toFixed(2));
+      }
+      if (Number.isFinite(Number(overlap))) {
+        const ovVal = Math.max(0.05, Math.min(0.99, Number(overlap)));
+        params.set('overlap', ovVal.toFixed(2));
+      }
+
+      const queryString = params.toString();
+      const endpoint = `${apiUrl}/${modelId}${queryString ? `?${queryString}` : ''}`;
+
+      const startedAt = performance.now();
+      const upstream = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: rawBase64,
+        signal: AbortSignal.timeout(15000),
+      });
+
+      const responseText = await upstream.text();
+      if (!upstream.ok) {
+        return res.status(upstream.status).json({
+          error: `Roboflow inference failed (HTTP ${upstream.status})`,
+          details: responseText.slice(0, 300),
+        });
+      }
+
+      const data: any = JSON.parse(responseText);
+      const elapsedMs = Number(
+        (
+          (typeof data.time === 'number' ? data.time * 1000 : null) ??
+          performance.now() - startedAt
+        ).toFixed(1)
+      );
+
+      return res.json({
+        inferenceId: data.inference_id || '',
+        inferenceMs: elapsedMs,
+        modelId: data.resolved_model?.model_id || modelId,
+        image: data.image || { width: 0, height: 0 },
+        predictions: Array.isArray(data.predictions) ? data.predictions : [],
+      });
+    } catch (err: any) {
+      return res.status(502).json({
+        error: err?.message || 'Failed to reach Roboflow inference API.',
+      });
+    }
+  });
+
   // Reverse geocoding & automatic government authority matching
   app.get('/api/geocode', async (req: Request, res: Response) => {
     const lat = Number(req.query.lat);

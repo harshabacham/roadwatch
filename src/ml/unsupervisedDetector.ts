@@ -1,8 +1,68 @@
-import { DetectionResult, PotholeDetectionItem, SeverityLevel } from '../types';
+import type {
+  BoundingBox,
+  DetectionResult,
+  PotholeDetectionItem,
+  SeverityLevel,
+  TrainedPotholeModel,
+} from '../types.ts';
 import {
   computeBaselineRoadEntropy,
   estimatePotholeDepthUnsupervised,
-} from './depthEstimator';
+} from './depthEstimator.ts';
+
+export const POTHOLE_FEATURE_NAMES = [
+  'meanZ',
+  'logRimRoughRatio',
+  'logRimCornerRatio',
+  'interiorLumDrop',
+  'brightPaintExcess',
+  'isotropy',
+  'entropyRatio',
+  'meanIsolation',
+  'fillDensity',
+  'cavityInteraction',
+] as const;
+
+export interface CandidateRegionSample {
+  features: number[];
+  box: BoundingBox;
+  patchCount: number;
+  meanZ: number;
+  isWaterlogged: boolean;
+}
+
+let activeTrainedModel: TrainedPotholeModel | null = null;
+
+export function setTrainedClassifierModel(
+  model: TrainedPotholeModel | null
+): void {
+  activeTrainedModel = model;
+}
+
+export function getTrainedClassifierModel(): TrainedPotholeModel | null {
+  return activeTrainedModel;
+}
+
+export function scoreFeatureVectorWithModel(
+  features: number[],
+  model: TrainedPotholeModel
+): number {
+  let logit = model.bias;
+  const len = Math.min(
+    features.length,
+    model.weights.length,
+    model.featureMeans.length,
+    model.featureStds.length
+  );
+  for (let i = 0; i < len; i++) {
+    const std = Math.max(1e-5, model.featureStds[i]);
+    const xNorm = (features[i] - model.featureMeans[i]) / std;
+    logit += model.weights[i] * xNorm;
+  }
+  if (logit > 30) return 1;
+  if (logit < -30) return 0;
+  return 1 / (1 + Math.exp(-logit));
+}
 
 export type DiagnosticOverlayMode =
   | 'detections'
@@ -111,6 +171,8 @@ interface PatchFeature {
   cornerEnergy: number; // Minor eigenvalue of structure tensor (Shi-Tomasi cornerness)
   isotropicRough: number; // meanGrad * (1 - 0.78 * coherence) + stdL
   chromaShift: number;
+  greenExcess: number;
+  isVegetation: boolean;
   warmth: number;
   rg: number;
   yb: number;
@@ -186,13 +248,13 @@ function getSensitivityConfig(preset: SensitivityPreset): SensitivityConfig {
     case 'balanced':
     default:
       return {
-        zThreshold: 2.35,
-        minPatchIsolation: 0.49,
-        minClusterMeanZ: 2.55,
-        minClusterPeakZ: 3.05,
-        minLumDepression: 0.062,
+        zThreshold: 2.15,
+        minPatchIsolation: 0.48,
+        minClusterMeanZ: 2.3,
+        minClusterPeakZ: 2.85,
+        minLumDepression: 0.055,
         minRoughRatio: 1.28,
-        minCornerEnergy: 0.015,
+        minCornerEnergy: 0.013,
         minRimRoughnessRatio: 1.22,
       };
   }
@@ -838,6 +900,43 @@ export function analyzePixelsUnsupervised(
   renderOverlay = false,
   forceBaselineTrain = false
 ): UnsupervisedAnalysisOutput {
+  return analyzePixelsInternal(data, params, renderOverlay, forceBaselineTrain)
+    .output;
+}
+
+/**
+ * Extracts 10D candidate region feature vectors in permissive mining mode
+ * so the backend supervised trainer can learn from both true potholes and
+ * hard negatives (shadows, lane markings, tar seams, clean coarse asphalt).
+ */
+export function extractCandidateRegionsForTraining(
+  data: Uint8ClampedArray
+): CandidateRegionSample[] {
+  const { minedCandidates } = analyzePixelsInternal(
+    data,
+    {
+      kClusters: 4,
+      sensitivity: 'sensitive',
+      dbscanMinPts: 3,
+      overlayMode: 'detections',
+    },
+    false,
+    false,
+    true
+  );
+  return minedCandidates;
+}
+
+function analyzePixelsInternal(
+  data: Uint8ClampedArray,
+  params: UnsupervisedParams,
+  renderOverlay = false,
+  forceBaselineTrain = false,
+  miningMode = false
+): {
+  output: UnsupervisedAnalysisOutput;
+  minedCandidates: CandidateRegionSample[];
+} {
   const startTime = performance.now();
 
   const totalPixels = ANALYSIS_WIDTH * ANALYSIS_HEIGHT;
@@ -897,7 +996,10 @@ export function analyzePixelsUnsupervised(
 
       let sumL = 0;
       let sumL2 = 0;
-      let sumG = 0;
+      let sumR = 0;
+      let sumGreen = 0;
+      let sumB = 0;
+      let sumGrad = 0;
       let peakG = 0;
       let sumChroma = 0;
       let sumWarmth = 0;
@@ -915,10 +1017,14 @@ export function analyzePixelsUnsupervised(
           const gVal = grad[p];
           const gxVal = gradX[p];
           const gyVal = gradY[p];
+          const pByte = p * 4;
 
           sumL += lVal;
           sumL2 += lVal * lVal;
-          sumG += gVal;
+          sumR += data[pByte] / 255;
+          sumGreen += data[pByte + 1] / 255;
+          sumB += data[pByte + 2] / 255;
+          sumGrad += gVal;
           if (gVal > peakG) peakG = gVal;
           sumChroma += chroma[p];
           sumWarmth += warmth[p];
@@ -932,9 +1038,15 @@ export function analyzePixelsUnsupervised(
       }
 
       const meanL = sumL / count;
+      const meanR = sumR / count;
+      const meanGreen = sumGreen / count;
+      const meanB = sumB / count;
+      const greenExcess = Math.max(0, meanGreen - Math.max(meanR, meanB));
+      const isVegetation =
+        meanGreen - meanR > 0.022 && meanGreen - meanB > 0.025;
       const variance = Math.max(0, sumL2 / count - meanL * meanL);
       const stdL = Math.sqrt(variance);
-      const meanGrad = sumG / count;
+      const meanGrad = sumGrad / count;
 
       // Structure tensor eigenvalues for orientation coherence & corner energy
       jxx /= count;
@@ -951,7 +1063,7 @@ export function analyzePixelsUnsupervised(
       const isotropicRough = meanGrad * (1 - 0.78 * coherence) + stdL * 0.85;
 
       const normY = (gy + 0.5) / rows;
-      const inRoadZone = normY >= 0.32;
+      const inRoadZone = normY >= 0.32 && !isVegetation;
 
       patches.push({
         gx,
@@ -967,6 +1079,8 @@ export function analyzePixelsUnsupervised(
         cornerEnergy,
         isotropicRough,
         chromaShift: sumChroma / count,
+        greenExcess,
+        isVegetation,
         warmth: sumWarmth / count,
         rg: sumRg / count,
         yb: sumYb / count,
@@ -1006,8 +1120,9 @@ export function analyzePixelsUnsupervised(
 
   for (let i = 0; i < numPatches; i++) {
     const p = patches[i];
-    // Exclude bright white/glare paint from road luminance background
-    const isRoadCandidatePixel = p.inRoadZone && p.meanL < 0.72;
+    // Exclude bright white/glare paint and green vegetation from road background
+    const isRoadCandidatePixel =
+      p.inRoadZone && !p.isVegetation && p.meanL < 0.72;
     const w = isRoadCandidatePixel ? 1 : 0;
     maskGrid[i] = w;
     lumGrid[i] = w * p.meanL;
@@ -1106,6 +1221,7 @@ export function analyzePixelsUnsupervised(
   // Unsupervised Road-Plane Estimation from bottom-center asphalt seed
   const seedPatches = patches.filter(
     (p) =>
+      !p.isVegetation &&
       p.gy >= Math.floor(rows * 0.62) &&
       p.gx >= Math.floor(cols * 0.2) &&
       p.gx <= Math.floor(cols * 0.8) &&
@@ -1116,16 +1232,19 @@ export function analyzePixelsUnsupervised(
     seedPatches.length > 0 ? median(seedPatches.map((p) => p.chromaShift)) : 0.05;
 
   for (const p of patches) {
-    if (!p.inRoadZone) {
+    if (!p.inRoadZone || p.isVegetation) {
       p.roadLikelihood = 0;
       continue;
     }
     const yNorm = (p.gy + 0.5) / rows;
     const colorDist = Math.abs(p.chromaShift - seedChroma);
     const lumDist = Math.abs(p.meanL - seedL);
-    // Upper strip (yNorm < 0.44) often contains distant parked cars, sidewalks, or sky reflections
+    // Upper zone (yNorm < 0.56) on edges or colorful roadside structures is penalized
     const horizonPenalty =
-      yNorm < 0.44 && (colorDist > 0.14 || lumDist > 0.25) ? 0.45 : 0;
+      (yNorm < 0.44 && (colorDist > 0.14 || lumDist > 0.25)) ||
+      (yNorm < 0.56 && p.greenExcess > 0.012)
+        ? 0.55
+        : 0;
     p.roadLikelihood = Math.max(
       0,
       Math.min(1, 1 - colorDist * 1.4 - horizonPenalty)
@@ -1433,15 +1552,27 @@ export function analyzePixelsUnsupervised(
     const hasPhysicalEvidence =
       hasBrokenAggregate || hasDarkCavityWithEdge || hasPuddleRimBreak;
 
+    const effectiveZThreshold = miningMode
+      ? Math.min(1.65, cfg.zThreshold)
+      : cfg.zThreshold;
+
     p.isAnomaly =
       p.roadLikelihood >= 0.45 &&
-      ensembleZ >= cfg.zThreshold &&
-      hasPhysicalEvidence;
+      ensembleZ >= effectiveZThreshold &&
+      (miningMode ? true : hasPhysicalEvidence);
   }
 
   // Waterlogged Pothole Basin Closure:
   // A rain-filled pothole has a smooth reflective interior (different luminance from road)
-  // bounded on >= 3 directions (or 2 opposite/adjacent sides near curb) by broken/dark rim patches!
+  // bounded on >= 3 directions (or 2 opposite sides) by fractured/rough rim patches!
+  const isRimBoundary = (q: PatchFeature) =>
+    q.isAnomaly ||
+    (q.inRoadZone &&
+      q.roadLikelihood >= 0.45 &&
+      q.anomalyZ >= 1.8 &&
+      q.cornerEnergy >= cfg.minCornerEnergy * 0.8 &&
+      q.isotropicRough >= baseRough * 1.12);
+
   const waterEnclosedSet = new Set<number>();
   for (let gy = roadStartGy + 1; gy < rows - 1; gy++) {
     for (let gx = 1; gx < cols - 1; gx++) {
@@ -1449,9 +1580,9 @@ export function analyzePixelsUnsupervised(
       if (!p.inRoadZone || p.isAnomaly || p.roadLikelihood < 0.45) continue;
 
       const isSmoothReflective =
-        p.stdL < 0.085 &&
-        p.meanGrad < 0.095 &&
-        (p.lumContrast >= 0.09 || p.meanL > baseL + 0.14) &&
+        p.stdL < 0.095 &&
+        p.meanGrad < 0.11 &&
+        (p.lumContrast >= 0.065 || p.meanL > baseL + 0.11) &&
         p.chromaShift < 0.18;
 
       if (!isSmoothReflective) continue;
@@ -1462,25 +1593,25 @@ export function analyzePixelsUnsupervised(
       let rimDown = false;
       const maxSearch = 12;
       for (let d = 1; d <= maxSearch; d++) {
-        if (gx - d >= 0 && patches[gy * cols + (gx - d)].isAnomaly) {
+        if (gx - d >= 0 && isRimBoundary(patches[gy * cols + (gx - d)])) {
           rimLeft = true;
           break;
         }
       }
       for (let d = 1; d <= maxSearch; d++) {
-        if (gx + d < cols && patches[gy * cols + (gx + d)].isAnomaly) {
+        if (gx + d < cols && isRimBoundary(patches[gy * cols + (gx + d)])) {
           rimRight = true;
           break;
         }
       }
       for (let d = 1; d <= maxSearch; d++) {
-        if (gy - d >= roadStartGy && patches[(gy - d) * cols + gx].isAnomaly) {
+        if (gy - d >= roadStartGy && isRimBoundary(patches[(gy - d) * cols + gx])) {
           rimUp = true;
           break;
         }
       }
       for (let d = 1; d <= maxSearch; d++) {
-        if (gy + d < rows && patches[(gy + d) * cols + gx].isAnomaly) {
+        if (gy + d < rows && isRimBoundary(patches[(gy + d) * cols + gx])) {
           rimDown = true;
           break;
         }
@@ -1495,12 +1626,38 @@ export function analyzePixelsUnsupervised(
       }
     }
   }
-  for (const idx of waterEnclosedSet) {
-    patches[idx].isAnomaly = true;
-    patches[idx].anomalyZ = Math.max(
-      patches[idx].anomalyZ,
-      cfg.zThreshold + 0.35
-    );
+  if (waterEnclosedSet.size >= 2) {
+    // Also promote adjacent fractured rim patches touching the enclosed puddle
+    const extraRim = new Set<number>();
+    for (const idx of waterEnclosedSet) {
+      const wp = patches[idx];
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const nx = wp.gx + dx;
+          const ny = wp.gy + dy;
+          if (nx >= 0 && nx < cols && ny >= roadStartGy && ny < rows) {
+            const np = patches[ny * cols + nx];
+            if (!np.isAnomaly && isRimBoundary(np)) {
+              extraRim.add(np.idx);
+            }
+          }
+        }
+      }
+    }
+    for (const idx of waterEnclosedSet) {
+      patches[idx].isAnomaly = true;
+      patches[idx].anomalyZ = Math.max(
+        patches[idx].anomalyZ,
+        cfg.zThreshold + 0.35
+      );
+    }
+    for (const idx of extraRim) {
+      patches[idx].isAnomaly = true;
+      patches[idx].anomalyZ = Math.max(
+        patches[idx].anomalyZ,
+        cfg.zThreshold + 0.15
+      );
+    }
   }
 
   // Compute baseline road Shannon entropy from non-anomalous normal road patches
@@ -1513,8 +1670,8 @@ export function analyzePixelsUnsupervised(
     PATCH_SIZE
   );
 
-  // Spatial DBSCAN clustering on verified anomaly patches (eps=1.55 keeps separate potholes distinct)
-  const dbscanRes = runDbscan(patches, 1.55, params.dbscanMinPts);
+  // Spatial DBSCAN clustering on verified anomaly patches (eps=2.25 bridges 1-patch puddle/rim gaps)
+  const dbscanRes = runDbscan(patches, 2.25, params.dbscanMinPts);
 
   // Gather candidate clusters & merge only overlapping/touching fragments
   interface RawClusterBox {
@@ -1566,6 +1723,7 @@ export function analyzePixelsUnsupervised(
   }
 
   const detections: PotholeDetectionItem[] = [];
+  const minedCandidates: CandidateRegionSample[] = [];
 
   for (const cluster of rawClusters) {
     const { members, minGx, maxGx, minGy, maxGy } = cluster;
@@ -1584,6 +1742,7 @@ export function analyzePixelsUnsupervised(
     let sumRough = 0;
     let sumCorner = 0;
     let sumIso = 0;
+    let sumCoherence = 0;
     let waterCount = 0;
     let sumRoadLik = 0;
 
@@ -1594,6 +1753,7 @@ export function analyzePixelsUnsupervised(
       sumRough += m.isotropicRough;
       sumCorner += m.cornerEnergy;
       sumIso += m.isolationScore;
+      sumCoherence += m.coherence;
       sumRoadLik += m.roadLikelihood;
       if (m.isWaterSeed) waterCount++;
     }
@@ -1603,15 +1763,20 @@ export function analyzePixelsUnsupervised(
     const meanRough = sumRough / members.length;
     const meanCorner = sumCorner / members.length;
     const meanIso = sumIso / members.length;
+    const meanCoherence = sumCoherence / members.length;
     const meanRoadLik = sumRoadLik / members.length;
     const isWaterlogged = waterCount >= Math.max(3, Math.floor(members.length * 0.2));
 
     // Geometry & plausibility filtering
     if (areaFrac < 0.007 || members.length < params.dbscanMinPts) continue;
-    if (aspectRatio > 4.2 && boxHPatches <= 2) continue;
-    if (aspectRatio < 0.24 && boxWPatches <= 2) continue;
-    if (fillDensity < 0.24 && members.length < 12) continue;
+    if (!miningMode && aspectRatio > 4.2 && boxHPatches <= 2) continue;
+    if (!miningMode && aspectRatio < 0.24 && boxWPatches <= 2) continue;
+    if (fillDensity < (isWaterlogged ? 0.16 : 0.24) && members.length < 12) continue;
     if (meanRoadLik < 0.55) continue;
+    // Exclude full-width bottom dashcam car hood / dashboard / wiper blades
+    if (boxWPatches >= cols * 0.78 && minGy / rows >= 0.76 && meanCoherence > 0.68) {
+      continue;
+    }
 
     // Region-level Outer Road Ring Verification (eliminates uniform shadows & clean-road noise!)
     const ringPad = 4;
@@ -1663,30 +1828,12 @@ export function analyzePixelsUnsupervised(
       (meanRough + 0.01) / Math.max(0.02, outerMeanRough + 0.01);
     const rimCornerRatio =
       (meanCorner + 0.005) / Math.max(0.008, outerMeanCorner + 0.005);
-    const interiorLumDrop = Math.max(
-      0,
-      outerMeanL - members.reduce((s, p) => s + p.meanL, 0) / members.length
-    );
-
-    // Must exceed ensemble Z & Isolation Forest thresholds AND pass structural contrast vs outer ring!
-    // (Large craters >8% of road area exhibit iForest masking, so relax iForest floor for wide cavities)
-    const effectiveMinIso = areaFrac > 0.08 ? 0.43 : cfg.minPatchIsolation;
-    if (meanZ < cfg.minClusterMeanZ && peakZ < cfg.minClusterPeakZ) continue;
-    if (meanIso < effectiveMinIso && peakZ < cfg.minClusterPeakZ + 0.4) continue;
-
-    const hasDeepBrokenCavity =
-      meanRough >= baseRough * 1.3 &&
-      meanCorner >= baseCorner * 1.35 &&
-      (interiorLumDrop >= cfg.minLumDepression ||
-        meanDep >= cfg.minLumDepression * 0.9);
-
-    const passesPhysicalCavityCheck = isWaterlogged
-      ? rimRoughRatio >= 1.08 || rimCornerRatio >= 1.2 || peakZ >= cfg.minClusterPeakZ
-      : hasDeepBrokenCavity ||
-        (rimRoughRatio >= cfg.minRimRoughnessRatio && rimCornerRatio >= 1.2) ||
-        (interiorLumDrop >= cfg.minLumDepression * 1.1 && rimCornerRatio >= 1.15);
-
-    if (!passesPhysicalCavityCheck) continue;
+    const innerMeanL =
+      members.reduce((s, p) => s + p.meanL, 0) / members.length;
+    const interiorLumDrop = Math.max(0, outerMeanL - innerMeanL);
+    const brightPaintExcess = isWaterlogged
+      ? 0
+      : Math.max(0, innerMeanL - outerMeanL);
 
     const xMin = Math.round((minGx / cols) * 1000);
     const yMin = Math.round((minGy / rows) * 1000);
@@ -1705,6 +1852,74 @@ export function analyzePixelsUnsupervised(
       baselineEntropyBits,
       fillDensity,
     });
+
+    const clampedZ = Math.min(8, meanZ);
+    const logRimRough = Math.log(Math.max(0.4, rimRoughRatio));
+    const logRimCorner = Math.log(Math.max(0.4, rimCornerRatio));
+    const isotropy = Math.max(0, 1 - meanCoherence);
+    const clampedEntropy = Math.min(2.6, depthResult.details.entropyRatio);
+    const cavityInteraction =
+      Math.max(0, logRimCorner) *
+      (interiorLumDrop * 5 + (isWaterlogged ? 0.45 : 0));
+
+    const featureVector: number[] = [
+      clampedZ,
+      logRimRough,
+      logRimCorner,
+      interiorLumDrop,
+      brightPaintExcess,
+      isotropy,
+      clampedEntropy,
+      meanIso,
+      fillDensity,
+      cavityInteraction,
+    ];
+
+    if (miningMode) {
+      minedCandidates.push({
+        features: featureVector,
+        box,
+        patchCount: members.length,
+        meanZ,
+        isWaterlogged,
+      });
+      continue;
+    }
+
+    // Must exceed ensemble Z & Isolation Forest thresholds AND pass structural contrast vs outer ring!
+    // (Large craters >8% of road area exhibit iForest masking, so relax iForest floor for wide cavities)
+    const effectiveMinIso = areaFrac > 0.08 ? 0.43 : cfg.minPatchIsolation;
+    const effectiveMinMeanZ = isWaterlogged
+      ? Math.min(cfg.minClusterMeanZ, cfg.zThreshold - 0.15)
+      : cfg.minClusterMeanZ;
+    if (meanZ < effectiveMinMeanZ && peakZ < cfg.minClusterPeakZ) continue;
+    if (meanIso < effectiveMinIso && peakZ < cfg.minClusterPeakZ + 0.4) continue;
+
+    const hasDeepBrokenCavity =
+      meanRough >= baseRough * 1.3 &&
+      meanCorner >= baseCorner * 1.35 &&
+      (interiorLumDrop >= cfg.minLumDepression ||
+        meanDep >= cfg.minLumDepression * 0.9);
+
+    const passesPhysicalCavityCheck = isWaterlogged
+      ? rimRoughRatio >= 1.08 || rimCornerRatio >= 1.2 || peakZ >= cfg.minClusterPeakZ
+      : hasDeepBrokenCavity ||
+        (rimRoughRatio >= cfg.minRimRoughnessRatio && rimCornerRatio >= 1.2) ||
+        (interiorLumDrop >= cfg.minLumDepression * 1.1 && rimCornerRatio >= 1.15);
+
+    if (!passesPhysicalCavityCheck) continue;
+
+    // Apply backend-trained supervised classifier if loaded (specifically tuned to suppress false positives)
+    let classifierProb: number | undefined;
+    if (activeTrainedModel) {
+      classifierProb = scoreFeatureVectorWithModel(
+        featureVector,
+        activeTrainedModel
+      );
+      if (classifierProb < activeTrainedModel.decisionThreshold) {
+        continue;
+      }
+    }
 
     const centerNormY = (minGy + maxGy + 1) / (2 * rows);
     const perspectiveFactor = 0.7 + (1 - centerNormY) * 1.1;
@@ -1741,12 +1956,16 @@ export function analyzePixelsUnsupervised(
       severity = 'Low';
     }
 
+    const baseConf =
+      62 + (meanZ - cfg.zThreshold) * 14 + (meanIso - 0.5) * 45 + fillDensity * 12;
     const clusterConfidence = Math.round(
       Math.min(
         98,
         Math.max(
           68,
-          62 + (meanZ - cfg.zThreshold) * 14 + (meanIso - 0.5) * 45 + fillDensity * 12
+          classifierProb !== undefined
+            ? 0.5 * baseConf + 0.5 * (classifierProb * 100)
+            : baseConf
         )
       )
     );
@@ -1769,6 +1988,10 @@ export function analyzePixelsUnsupervised(
       mahalanobisZ: Number(meanZ.toFixed(2)),
       luminanceDropPct,
       roughnessScorePct,
+      classifierProbability:
+        classifierProb !== undefined
+          ? Number(classifierProb.toFixed(3))
+          : undefined,
       hazardDescription: `${
         isWaterlogged ? 'Water-filled roadway cavity' : 'Roadway cavity'
       } approx. ${estimatedWidthCm} cm wide and ${
@@ -1952,38 +2175,41 @@ export function analyzePixelsUnsupervised(
       : 0;
 
   return {
-    detection: {
-      potholeDetected,
-      overallSeverity,
-      confidence: overallConfidence,
-      roadSurfaceType,
-      detections: topDetections,
-      formalComplaintTitle,
-      formalComplaintDescription,
-      recommendedDepartment: 'Department of Transportation — Roadway Maintenance',
-      analyzedAt: new Date().toISOString(),
+    minedCandidates,
+    output: {
+      detection: {
+        potholeDetected,
+        overallSeverity,
+        confidence: overallConfidence,
+        roadSurfaceType,
+        detections: topDetections,
+        formalComplaintTitle,
+        formalComplaintDescription,
+        recommendedDepartment: 'Department of Transportation — Roadway Maintenance',
+        analyzedAt: new Date().toISOString(),
+      },
+      metrics: {
+        inferenceMs,
+        gridCols: cols,
+        gridRows: rows,
+        totalPatches: patches.length,
+        roadPatches: roadPatches.length,
+        kClusters: params.kClusters,
+        kmeansIterations: kmeans.iterations,
+        wcss: Number(kmeans.wcss.toFixed(1)),
+        silhouetteScore: Number(silhouette.toFixed(2)),
+        anomalyThresholdZ: cfg.zThreshold,
+        anomalousPatchCount,
+        dbscanClustersFound: topDetections.length,
+        noisePatchesPruned: dbscanRes.noiseCount,
+        baselineLuminanceMean: Number(baseL.toFixed(2)),
+        baselineRoughnessMean: Number(baseRough.toFixed(2)),
+        trainedFrames: learnedRoadBaseline.framesTrained,
+        gmmLogLikelihood: Number(gmm.avgLogLikelihood.toFixed(2)),
+        isolationScoreMean: Number(meanIsoAll.toFixed(2)),
+      },
+      clusters,
+      overlayDataUrl,
     },
-    metrics: {
-      inferenceMs,
-      gridCols: cols,
-      gridRows: rows,
-      totalPatches: patches.length,
-      roadPatches: roadPatches.length,
-      kClusters: params.kClusters,
-      kmeansIterations: kmeans.iterations,
-      wcss: Number(kmeans.wcss.toFixed(1)),
-      silhouetteScore: Number(silhouette.toFixed(2)),
-      anomalyThresholdZ: cfg.zThreshold,
-      anomalousPatchCount,
-      dbscanClustersFound: topDetections.length,
-      noisePatchesPruned: dbscanRes.noiseCount,
-      baselineLuminanceMean: Number(baseL.toFixed(2)),
-      baselineRoughnessMean: Number(baseRough.toFixed(2)),
-      trainedFrames: learnedRoadBaseline.framesTrained,
-      gmmLogLikelihood: Number(gmm.avgLogLikelihood.toFixed(2)),
-      isolationScoreMean: Number(meanIsoAll.toFixed(2)),
-    },
-    clusters,
-    overlayDataUrl,
   };
 }
