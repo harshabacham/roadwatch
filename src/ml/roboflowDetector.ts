@@ -16,6 +16,14 @@ import {
   type UnsupervisedMetrics,
   type UnsupervisedParams,
 } from './unsupervisedDetector';
+import {
+  computeConfidenceStats,
+  recordDetectionDiagnostic,
+  type DetectionDiagnosticEntry,
+  type DetectionRoute,
+  type PreprocessingDiagnostics,
+  type TransportDiagnostics,
+} from './detectionDiagnostics';
 
 export interface RoboflowPrediction {
   x: number;
@@ -141,6 +149,116 @@ function computeCropVisualSignature(
 
 let reusableCaptureCanvas: HTMLCanvasElement | null = null;
 let reusableAnalysisCanvas: HTMLCanvasElement | null = null;
+let proxyUnavailable = false;
+
+const DIRECT_ROBOFLOW_API_URL = (
+  (import.meta as any).env?.VITE_ROBOFLOW_API_URL ||
+  'https://serverless.roboflow.com'
+).replace(/\/+$/, '');
+const DIRECT_ROBOFLOW_MODEL_ID = (
+  (import.meta as any).env?.VITE_ROBOFLOW_MODEL_ID ||
+  'pothole-detection-bqu6s-dwjbo/1'
+).replace(/^\/+/, '');
+const DIRECT_ROBOFLOW_API_KEY = (
+  (import.meta as any).env?.VITE_ROBOFLOW_API_KEY ||
+  '796gBoiSCcsgn1e1nXgt'
+).trim();
+
+interface DirectRoboflowCallResult {
+  payload: RoboflowProxyResponse;
+  status: number;
+  latencyMs: number;
+}
+
+async function inferViaDirectRoboflow(
+  imageDataUrl: string,
+  confidence: number,
+  overlap: number
+): Promise<DirectRoboflowCallResult> {
+  const commaIdx = imageDataUrl.indexOf(',');
+  const rawBase64 =
+    commaIdx >= 0 ? imageDataUrl.slice(commaIdx + 1).trim() : imageDataUrl.trim();
+  const params = new URLSearchParams({
+    api_key: DIRECT_ROBOFLOW_API_KEY,
+    confidence: Math.max(0.05, Math.min(0.99, confidence)).toFixed(2),
+    overlap: Math.max(0.05, Math.min(0.99, overlap)).toFixed(2),
+  });
+  const endpoint = `${DIRECT_ROBOFLOW_API_URL}/${DIRECT_ROBOFLOW_MODEL_ID}?${params.toString()}`;
+
+  // Use a CORS-simple POST (safelisted Content-Type, no custom Authorization header)
+  // because serverless.roboflow.com omits Access-Control-Allow-Origin on OPTIONS preflights
+  // while returning Access-Control-Allow-Origin properly on simple POST responses.
+  const startedAt = performance.now();
+  let upstream: globalThis.Response | null = null;
+  let lastErr: unknown = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      upstream = await fetch(endpoint, {
+        method: 'POST',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: rawBase64,
+      });
+      if (upstream.ok || (upstream.status < 500 && upstream.status !== 429)) {
+        break;
+      }
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  }
+
+  const latencyMs = Number((performance.now() - startedAt).toFixed(1));
+
+  if (!upstream) {
+    const err = new Error(
+      lastErr instanceof Error
+        ? lastErr.message
+        : 'Direct Roboflow inference request failed'
+    ) as Error & { status?: number; latencyMs?: number };
+    err.latencyMs = latencyMs;
+    throw err;
+  }
+
+  if (!upstream.ok) {
+    const errText = await upstream.text().catch(() => '');
+    const err = new Error(
+      `Direct Roboflow inference failed (HTTP ${upstream.status}): ${errText.slice(0, 200)}`
+    ) as Error & { status?: number; latencyMs?: number };
+    err.status = upstream.status;
+    err.latencyMs = latencyMs;
+    throw err;
+  }
+
+  const data: any = await upstream.json();
+  const elapsedMs = Number(
+    (
+      (typeof data.time === 'number' ? data.time * 1000 : null) ??
+      latencyMs
+    ).toFixed(1)
+  );
+
+  return {
+    status: upstream.status,
+    latencyMs,
+    payload: {
+      inferenceId: data.inference_id || '',
+      inferenceMs: elapsedMs,
+      modelId: data.resolved_model?.model_id || DIRECT_ROBOFLOW_MODEL_ID,
+      image: data.image || { width: 0, height: 0 },
+      predictions: Array.isArray(data.predictions) ? data.predictions : [],
+    },
+  };
+}
 
 function getConfidenceThreshold(sensitivity: SensitivityPreset): number {
   switch (sensitivity) {
@@ -164,7 +282,25 @@ function captureFrameForRoboflow(
   height: number;
   sourceWidth: number;
   sourceHeight: number;
+  sourceType: 'video' | 'image' | 'canvas';
+  isVideoStream: boolean;
+  videoReadyState: number | null;
+  targetMaxDimension: number;
+  jpegQuality: number;
+  scaleFactor: number;
+  encodedBytes: number;
+  captureMs: number;
 } | null {
+  const captureStart = performance.now();
+  const sourceType: 'video' | 'image' | 'canvas' =
+    source instanceof HTMLVideoElement
+      ? 'video'
+      : source instanceof HTMLImageElement
+      ? 'image'
+      : 'canvas';
+  const videoReadyState =
+    source instanceof HTMLVideoElement ? source.readyState : null;
+
   if (source instanceof HTMLVideoElement && source.readyState < 2) {
     return null;
   }
@@ -211,13 +347,27 @@ function captureFrameForRoboflow(
   ctx.imageSmoothingQuality = isVideo ? 'medium' : 'high';
   ctx.drawImage(source, 0, 0, width, height);
 
+  const dataUrl = canvas.toDataURL('image/jpeg', jpegQuality);
+  const commaIdx = dataUrl.indexOf(',');
+  const base64Len = commaIdx >= 0 ? dataUrl.length - commaIdx - 1 : dataUrl.length;
+  const encodedBytes = Math.round((base64Len * 3) / 4);
+  const captureMs = Number((performance.now() - captureStart).toFixed(1));
+
   return {
     canvas,
-    dataUrl: canvas.toDataURL('image/jpeg', jpegQuality),
+    dataUrl,
     width,
     height,
     sourceWidth: srcWidth,
     sourceHeight: srcHeight,
+    sourceType,
+    isVideoStream: isVideo,
+    videoReadyState,
+    targetMaxDimension: maxDim,
+    jpegQuality,
+    scaleFactor: Number(scale.toFixed(4)),
+    encodedBytes,
+    captureMs,
   };
 }
 
@@ -228,7 +378,11 @@ function extractFrameLuminanceAndGradient(
   gradient: Float32Array;
   baselineLuminance: number;
   baselineEntropyBits: number;
+  frameMeanLuminance: number;
+  isLikelyBlankFrame: boolean;
+  surfaceAnalysisMs: number;
 } | null {
+  const analysisStart = performance.now();
   const canvas = reusableAnalysisCanvas || document.createElement('canvas');
   reusableAnalysisCanvas = canvas;
   if (canvas.width !== ANALYSIS_W || canvas.height !== ANALYSIS_H) {
@@ -246,17 +400,26 @@ function extractFrameLuminanceAndGradient(
 
   let roadLumSum = 0;
   let roadLumCount = 0;
+  let allLumSum = 0;
+  let allLumSqSum = 0;
   const roadStartY = Math.floor(ANALYSIS_H * 0.35);
 
   for (let i = 0, p = 0; i < data.length; i += 4, p++) {
     const l =
       (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) / 255;
     luminance[p] = l;
+    allLumSum += l;
+    allLumSqSum += l * l;
     if (p >= roadStartY * ANALYSIS_W && l < 0.72) {
       roadLumSum += l;
       roadLumCount++;
     }
   }
+
+  const frameMeanLuminance = total > 0 ? allLumSum / total : 0;
+  const frameLumVariance =
+    total > 0 ? Math.max(0, allLumSqSum / total - frameMeanLuminance * frameMeanLuminance) : 0;
+  const isLikelyBlankFrame = frameMeanLuminance < 0.015 || frameLumVariance < 0.00015;
 
   for (let y = 1; y < ANALYSIS_H - 1; y++) {
     const row = y * ANALYSIS_W;
@@ -300,7 +463,17 @@ function extractFrameLuminanceAndGradient(
     patchSize
   );
 
-  return { luminance, gradient, baselineLuminance, baselineEntropyBits };
+  const surfaceAnalysisMs = Number((performance.now() - analysisStart).toFixed(1));
+
+  return {
+    luminance,
+    gradient,
+    baselineLuminance,
+    baselineEntropyBits,
+    frameMeanLuminance: Number(frameMeanLuminance.toFixed(4)),
+    isLikelyBlankFrame,
+    surfaceAnalysisMs,
+  };
 }
 
 function estimateSeverity(
@@ -326,6 +499,8 @@ export interface RoboflowDetectionOutput extends UnsupervisedAnalysisOutput {
   frameSignature?: VisualFrameSignature;
   /** Per-detection visual crop descriptors aligned with detection.detections indices. */
   cropSignatures?: Float32Array[];
+  /** Structured diagnostic trace for comparing dev vs production preprocessing & confidence scores. */
+  diagnostics?: DetectionDiagnosticEntry;
 }
 
 /**
@@ -341,8 +516,92 @@ export async function detectPotholesWithRoboflow(
   params: UnsupervisedParams,
   options?: FrameCaptureOptions
 ): Promise<RoboflowDetectionOutput | null> {
+  const overallStart = performance.now();
+  const confidenceThreshold = getConfidenceThreshold(params.sensitivity);
+  const overlapThreshold = 0.45;
+
   const frame = captureFrameForRoboflow(source, options);
-  if (!frame) return null;
+  if (!frame) {
+    const sourceType: 'video' | 'image' | 'canvas' =
+      source instanceof HTMLVideoElement
+        ? 'video'
+        : source instanceof HTMLImageElement
+        ? 'image'
+        : 'canvas';
+    recordDetectionDiagnostic({
+      preprocessing: {
+        sourceType,
+        isVideoStream: options?.isVideoStream ?? source instanceof HTMLVideoElement,
+        videoReadyState: source instanceof HTMLVideoElement ? source.readyState : null,
+        sourceWidth:
+          source instanceof HTMLVideoElement
+            ? source.videoWidth
+            : source instanceof HTMLImageElement
+            ? source.naturalWidth
+            : source.width,
+        sourceHeight:
+          source instanceof HTMLVideoElement
+            ? source.videoHeight
+            : source instanceof HTMLImageElement
+            ? source.naturalHeight
+            : source.height,
+        targetMaxDimension: options?.maxDimension ?? 640,
+        jpegQuality: options?.jpegQuality ?? 0.72,
+        scaleFactor: 0,
+        downsampledWidth: 0,
+        downsampledHeight: 0,
+        encodedBytes: 0,
+        captureMs: Number((performance.now() - overallStart).toFixed(1)),
+        surfaceAnalysisMs: 0,
+        frameMeanLuminance: null,
+        baselineLuminance: null,
+        baselineEntropyBits: null,
+        isLikelyBlankFrame: true,
+      },
+      transport: {
+        route: 'skipped-capture',
+        proxyAttempted: false,
+        proxyStatus: null,
+        proxyContentType: null,
+        proxyLatencyMs: null,
+        proxyError: null,
+        directAttempted: false,
+        directStatus: null,
+        directLatencyMs: null,
+        directError: null,
+        fallbackReason:
+          source instanceof HTMLVideoElement && source.readyState < 2
+            ? `Video not ready (readyState=${source.readyState})`
+            : 'Source media had zero intrinsic dimensions',
+      },
+      predictions: {
+        engine: 'none',
+        modelId: 'none',
+        sensitivityPreset: params.sensitivity,
+        confidenceThreshold,
+        overlapThreshold,
+        returnedImageWidth: null,
+        returnedImageHeight: null,
+        rawCount: 0,
+        filteredCount: 0,
+        droppedBelowThresholdCount: 0,
+        rawConfidences: [],
+        filteredConfidences: [],
+        minConfidence: null,
+        meanConfidence: null,
+        maxConfidence: null,
+        boxes: [],
+      },
+      timing: {
+        preprocessingMs: Number((performance.now() - overallStart).toFixed(1)),
+        networkMs: 0,
+        postprocessingMs: 0,
+        reportedModelInferenceMs: null,
+        totalMs: Number((performance.now() - overallStart).toFixed(1)),
+      },
+    });
+    return null;
+  }
 
   const downsampledSize: DownsampledFrameInfo = {
     width: frame.width,
@@ -361,7 +620,44 @@ export async function detectPotholesWithRoboflow(
       ? analyzeFrameUnsupervised(frame.canvas, params)
       : null;
 
+  const preprocessingDiag: PreprocessingDiagnostics = {
+    sourceType: frame.sourceType,
+    isVideoStream: frame.isVideoStream,
+    videoReadyState: frame.videoReadyState,
+    sourceWidth: frame.sourceWidth,
+    sourceHeight: frame.sourceHeight,
+    targetMaxDimension: frame.targetMaxDimension,
+    jpegQuality: frame.jpegQuality,
+    scaleFactor: frame.scaleFactor,
+    downsampledWidth: frame.width,
+    downsampledHeight: frame.height,
+    encodedBytes: frame.encodedBytes,
+    captureMs: frame.captureMs,
+    surfaceAnalysisMs: surface?.surfaceAnalysisMs ?? 0,
+    frameMeanLuminance: surface?.frameMeanLuminance ?? null,
+    baselineLuminance: surface ? Number(surface.baselineLuminance.toFixed(4)) : null,
+    baselineEntropyBits: surface ? Number(surface.baselineEntropyBits.toFixed(3)) : null,
+    isLikelyBlankFrame: surface?.isLikelyBlankFrame ?? false,
+  };
+
+  const preprocessingMs = Number((performance.now() - overallStart).toFixed(1));
+
+  const transportDiag: TransportDiagnostics = {
+    route: 'server-proxy',
+    proxyAttempted: false,
+    proxyStatus: null,
+    proxyContentType: null,
+    proxyLatencyMs: null,
+    proxyError: null,
+    directAttempted: false,
+    directStatus: null,
+    directLatencyMs: null,
+    directError: null,
+    fallbackReason: null,
+  };
+
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    const postStart = performance.now();
     const offline =
       localOverlayPass || analyzeFrameUnsupervised(frame.canvas, params);
     if (!offline) return null;
@@ -370,6 +666,56 @@ export async function detectPotholesWithRoboflow(
           computeCropVisualSignature(surface.luminance, ANALYSIS_W, ANALYSIS_H, d.box)
         )
       : undefined;
+    const offlineScores = offline.detection.detections.map((d) =>
+      Number((d.classifierProbability ?? offline.detection.confidence / 100).toFixed(4))
+    );
+    const offlineStats = computeConfidenceStats(offlineScores);
+    const postMs = Number((performance.now() - postStart).toFixed(1));
+    const totalEndMs = Number((performance.now() - overallStart).toFixed(1));
+    const diagEntry = recordDetectionDiagnostic({
+      preprocessing: preprocessingDiag,
+      transport: {
+        ...transportDiag,
+        route: 'offline-fallback',
+        fallbackReason: 'navigator.onLine is false',
+      },
+      predictions: {
+        engine: 'offline-fallback',
+        modelId: 'offline-local-cv',
+        sensitivityPreset: params.sensitivity,
+        confidenceThreshold,
+        overlapThreshold,
+        returnedImageWidth: frame.width,
+        returnedImageHeight: frame.height,
+        rawCount: offline.detection.detections.length,
+        filteredCount: offline.detection.detections.length,
+        droppedBelowThresholdCount: 0,
+        rawConfidences: offlineScores,
+        filteredConfidences: offlineScores,
+        minConfidence: offlineStats.min,
+        meanConfidence: offlineStats.mean,
+        maxConfidence: offlineStats.max,
+        boxes: offline.detection.detections.map((d, i) => ({
+          index: i + 1,
+          label: d.label,
+          confidence: offlineScores[i] ?? 0,
+          severity: d.severity,
+          widthCm: d.estimatedWidthCm,
+          depthCm: d.estimatedDepthCm,
+          xMin: d.box.xMin,
+          yMin: d.box.yMin,
+          xMax: d.box.xMax,
+          yMax: d.box.yMax,
+        })),
+      },
+      timing: {
+        preprocessingMs,
+        networkMs: 0,
+        postprocessingMs: postMs,
+        reportedModelInferenceMs: offline.metrics.inferenceMs,
+        totalMs: totalEndMs,
+      },
+    });
     return {
       ...offline,
       engine: 'offline-fallback',
@@ -378,40 +724,132 @@ export async function detectPotholesWithRoboflow(
       downsampledSize,
       frameSignature,
       cropSignatures: offlineCrops,
+      diagnostics: diagEntry,
     };
   }
 
   const startedAt = performance.now();
-  const confidenceThreshold = getConfidenceThreshold(params.sensitivity);
 
   try {
-    const res = await fetch('/api/detect/roboflow', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    let payload: RoboflowProxyResponse | null = null;
+    let activeRoute: DetectionRoute = 'server-proxy';
+
+    // Try server-side proxy first (when full-stack server.ts is active)
+    if (!proxyUnavailable) {
+      transportDiag.proxyAttempted = true;
+      const proxyStart = performance.now();
+      let res: globalThis.Response | null = null;
+      const reqBody = JSON.stringify({
         imageDataUrl: frame.dataUrl,
         confidence: confidenceThreshold,
-        overlap: 0.45,
-      }),
-    });
+        overlap: overlapThreshold,
+      });
 
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      throw new Error(
-        errBody.error || `Inference API responded with HTTP ${res.status}`
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          res = await fetch('/api/detect/roboflow', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: reqBody,
+          });
+          if (res.ok || (res.status !== 502 && res.status !== 503 && res.status !== 504)) {
+            break;
+          }
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        } catch (err) {
+          transportDiag.proxyError =
+            err instanceof Error ? err.message : String(err);
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        }
+      }
+
+      transportDiag.proxyLatencyMs = Number(
+        (performance.now() - proxyStart).toFixed(1)
       );
+
+      if (res) {
+        transportDiag.proxyStatus = res.status;
+        transportDiag.proxyContentType = res.headers.get('content-type') || null;
+      }
+
+      if (res && res.ok) {
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('application/json')) {
+          const parsed = (await res.json().catch(() => null)) as RoboflowProxyResponse | null;
+          if (parsed && Array.isArray(parsed.predictions)) {
+            payload = parsed;
+            activeRoute = 'server-proxy';
+          } else {
+            transportDiag.proxyError = 'JSON response missing predictions array';
+            proxyUnavailable = true;
+          }
+        } else {
+          // Static SPA host returned index.html instead of JSON API response
+          transportDiag.proxyError = `Non-JSON content-type (${contentType || 'empty'})`;
+          proxyUnavailable = true;
+        }
+      } else if (
+        res &&
+        (res.status === 401 ||
+          res.status === 403 ||
+          res.status === 404 ||
+          res.status === 405)
+      ) {
+        // Static / shared deploy without backend proxy — switch directly to Roboflow
+        transportDiag.proxyError = `Proxy returned HTTP ${res.status}`;
+        proxyUnavailable = true;
+      } else if (res) {
+        transportDiag.proxyError = `Proxy returned HTTP ${res.status}`;
+      }
     }
 
-    const payload = (await res.json()) as RoboflowProxyResponse;
+    // Fallback to direct Roboflow Serverless inference when backend proxy is absent/unavailable
+    if (!payload) {
+      transportDiag.directAttempted = true;
+      try {
+        const directRes = await inferViaDirectRoboflow(
+          frame.dataUrl,
+          confidenceThreshold,
+          overlapThreshold
+        );
+        transportDiag.directStatus = directRes.status;
+        transportDiag.directLatencyMs = directRes.latencyMs;
+        payload = directRes.payload;
+        activeRoute = 'direct-roboflow';
+      } catch (directErr: any) {
+        transportDiag.directStatus = directErr?.status ?? null;
+        transportDiag.directLatencyMs = directErr?.latencyMs ?? null;
+        transportDiag.directError =
+          directErr instanceof Error ? directErr.message : String(directErr);
+        throw directErr;
+      }
+    }
+
+    transportDiag.route = activeRoute;
+    const networkMs = Number((performance.now() - startedAt).toFixed(1));
+    const postStart = performance.now();
+
     const imgW = payload.image?.width || frame.width;
     const imgH = payload.image?.height || frame.height;
     const rawPredictions = Array.isArray(payload.predictions)
       ? payload.predictions
       : [];
 
+    const rawConfidences = rawPredictions
+      .map((p) => Number((p.confidence ?? 0).toFixed(4)))
+      .sort((a, b) => b - a);
+
     const filteredPredictions = rawPredictions
       .filter((p) => (p.confidence ?? 0) >= confidenceThreshold)
       .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+
+    const filteredConfidences = filteredPredictions.map((p) =>
+      Number((p.confidence ?? 0).toFixed(4))
+    );
 
     const detections: PotholeDetectionItem[] = [];
 
@@ -662,20 +1100,73 @@ export async function detectPotholesWithRoboflow(
         )
       : undefined;
 
+    const postprocessingMs = Number((performance.now() - postStart).toFixed(1));
+    const overallTotalMs = Number((performance.now() - overallStart).toFixed(1));
+    const confStats = computeConfidenceStats(filteredConfidences);
+    const resolvedModelId = payload.modelId || 'pothole-detection-bqu6s-dwjbo/1';
+
+    const diagEntry = recordDetectionDiagnostic({
+      preprocessing: preprocessingDiag,
+      transport: transportDiag,
+      predictions: {
+        engine: 'roboflow',
+        modelId: resolvedModelId,
+        sensitivityPreset: params.sensitivity,
+        confidenceThreshold,
+        overlapThreshold,
+        returnedImageWidth: payload.image?.width ?? null,
+        returnedImageHeight: payload.image?.height ?? null,
+        rawCount: rawPredictions.length,
+        filteredCount: filteredPredictions.length,
+        droppedBelowThresholdCount: Math.max(
+          0,
+          rawPredictions.length - filteredPredictions.length
+        ),
+        rawConfidences,
+        filteredConfidences,
+        minConfidence: confStats.min,
+        meanConfidence: confStats.mean,
+        maxConfidence: confStats.max,
+        boxes: detections.map((d, i) => ({
+          index: i + 1,
+          label: d.label,
+          confidence: filteredConfidences[i] ?? d.classifierProbability ?? 0,
+          severity: d.severity,
+          widthCm: d.estimatedWidthCm,
+          depthCm: d.estimatedDepthCm,
+          xMin: d.box.xMin,
+          yMin: d.box.yMin,
+          xMax: d.box.xMax,
+          yMax: d.box.yMax,
+        })),
+      },
+      timing: {
+        preprocessingMs,
+        networkMs,
+        postprocessingMs,
+        reportedModelInferenceMs: payload.inferenceMs ?? null,
+        totalMs: overallTotalMs,
+      },
+    });
+
     return {
       detection,
       metrics,
       clusters,
       overlayDataUrl: localOverlayPass?.overlayDataUrl || '',
       engine: 'roboflow',
-      modelId: payload.modelId || 'pothole-detection-bqu6s-dwjbo/1',
+      modelId: resolvedModelId,
       snapshotDataUrl: frame.dataUrl,
       downsampledSize,
       frameSignature,
       cropSignatures,
+      diagnostics: diagEntry,
     };
   } catch (err) {
-    console.warn('Roboflow inference failed, falling back to offline detector:', err);
+    const networkMs = Number((performance.now() - startedAt).toFixed(1));
+    const fallbackStart = performance.now();
+    const fallbackReason = err instanceof Error ? err.message : String(err);
+
     const offline =
       localOverlayPass || analyzeFrameUnsupervised(frame.canvas, params);
     if (!offline) return null;
@@ -684,6 +1175,59 @@ export async function detectPotholesWithRoboflow(
           computeCropVisualSignature(surface.luminance, ANALYSIS_W, ANALYSIS_H, d.box)
         )
       : undefined;
+
+    const offlineScores = offline.detection.detections.map((d) =>
+      Number((d.classifierProbability ?? offline.detection.confidence / 100).toFixed(4))
+    );
+    const offlineStats = computeConfidenceStats(offlineScores);
+    const postMs = Number((performance.now() - fallbackStart).toFixed(1));
+    const overallTotalMs = Number((performance.now() - overallStart).toFixed(1));
+
+    const diagEntry = recordDetectionDiagnostic({
+      preprocessing: preprocessingDiag,
+      transport: {
+        ...transportDiag,
+        route: 'offline-fallback',
+        fallbackReason,
+      },
+      predictions: {
+        engine: 'offline-fallback',
+        modelId: 'offline-local-cv',
+        sensitivityPreset: params.sensitivity,
+        confidenceThreshold,
+        overlapThreshold,
+        returnedImageWidth: frame.width,
+        returnedImageHeight: frame.height,
+        rawCount: offline.detection.detections.length,
+        filteredCount: offline.detection.detections.length,
+        droppedBelowThresholdCount: 0,
+        rawConfidences: offlineScores,
+        filteredConfidences: offlineScores,
+        minConfidence: offlineStats.min,
+        meanConfidence: offlineStats.mean,
+        maxConfidence: offlineStats.max,
+        boxes: offline.detection.detections.map((d, i) => ({
+          index: i + 1,
+          label: d.label,
+          confidence: offlineScores[i] ?? 0,
+          severity: d.severity,
+          widthCm: d.estimatedWidthCm,
+          depthCm: d.estimatedDepthCm,
+          xMin: d.box.xMin,
+          yMin: d.box.yMin,
+          xMax: d.box.xMax,
+          yMax: d.box.yMax,
+        })),
+      },
+      timing: {
+        preprocessingMs,
+        networkMs,
+        postprocessingMs: postMs,
+        reportedModelInferenceMs: offline.metrics.inferenceMs,
+        totalMs: overallTotalMs,
+      },
+    });
+
     return {
       ...offline,
       engine: 'offline-fallback',
@@ -692,6 +1236,7 @@ export async function detectPotholesWithRoboflow(
       downsampledSize,
       frameSignature,
       cropSignatures: offlineCrops,
+      diagnostics: diagEntry,
     };
   }
 }

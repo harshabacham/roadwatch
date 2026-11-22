@@ -256,7 +256,7 @@ function resolveGovernmentPortal(
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '15mb' }));
+  app.use(express.json({ limit: '25mb' }));
 
   // Health check
   app.get('/api/health', (_req: Request, res: Response) => {
@@ -272,7 +272,9 @@ async function startServer() {
       const modelId = (
         process.env.ROBOFLOW_MODEL_ID || 'pothole-detection-bqu6s-dwjbo/1'
       ).replace(/^\/+/, '');
-      const apiKey = (process.env.ROBOFLOW_API_KEY || '').trim();
+      const apiKey = (
+        process.env.ROBOFLOW_API_KEY || '796gBoiSCcsgn1e1nXgt'
+      ).trim();
 
       if (!apiKey) {
         return res.status(503).json({
@@ -312,18 +314,81 @@ async function startServer() {
       const endpoint = `${apiUrl}/${modelId}${queryString ? `?${queryString}` : ''}`;
 
       const startedAt = performance.now();
-      const upstream = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: rawBase64,
-        signal: AbortSignal.timeout(15000),
-      });
+      const payloadBytes = Math.round((rawBase64.length * 3) / 4);
+      const keySource = process.env.ROBOFLOW_API_KEY?.trim() ? 'env' : 'fallback';
+      const serverEnv = process.env.NODE_ENV || 'development';
+      let upstream: globalThis.Response | null = null;
+      let lastErr: unknown = null;
+      let attemptsUsed = 0;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        attemptsUsed = attempt + 1;
+        try {
+          upstream = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: rawBase64,
+            signal: AbortSignal.timeout(15000),
+          });
+          if (upstream.ok || (upstream.status < 500 && upstream.status !== 429)) {
+            break;
+          }
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        } catch (err) {
+          lastErr = err;
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        }
+      }
+
+      const upstreamRoundTripMs = Number((performance.now() - startedAt).toFixed(1));
+
+      if (!upstream) {
+        const errMsg =
+          lastErr instanceof Error
+            ? lastErr.message
+            : 'Failed to reach Roboflow inference API.';
+        console.warn(
+          '[RoadWatch:ServerDetect]',
+          JSON.stringify({
+            env: serverEnv,
+            keySource,
+            modelId,
+            confidence: params.get('confidence'),
+            overlap: params.get('overlap'),
+            payloadBytes,
+            attemptsUsed,
+            upstreamStatus: null,
+            upstreamRoundTripMs,
+            error: errMsg,
+          })
+        );
+        throw new Error(errMsg);
+      }
 
       const responseText = await upstream.text();
       if (!upstream.ok) {
+        console.warn(
+          '[RoadWatch:ServerDetect]',
+          JSON.stringify({
+            env: serverEnv,
+            keySource,
+            modelId,
+            confidence: params.get('confidence'),
+            overlap: params.get('overlap'),
+            payloadBytes,
+            attemptsUsed,
+            upstreamStatus: upstream.status,
+            upstreamRoundTripMs,
+            error: responseText.slice(0, 200),
+          })
+        );
         return res.status(upstream.status).json({
           error: `Roboflow inference failed (HTTP ${upstream.status})`,
           details: responseText.slice(0, 300),
@@ -331,11 +396,34 @@ async function startServer() {
       }
 
       const data: any = JSON.parse(responseText);
+      const predictions = Array.isArray(data.predictions) ? data.predictions : [];
+      const confidences = predictions
+        .map((p: any) => Number((Number(p.confidence) || 0).toFixed(4)))
+        .sort((a: number, b: number) => b - a);
       const elapsedMs = Number(
         (
           (typeof data.time === 'number' ? data.time * 1000 : null) ??
-          performance.now() - startedAt
+          upstreamRoundTripMs
         ).toFixed(1)
+      );
+
+      console.info(
+        '[RoadWatch:ServerDetect]',
+        JSON.stringify({
+          env: serverEnv,
+          keySource,
+          modelId: data.resolved_model?.model_id || modelId,
+          confidence: params.get('confidence'),
+          overlap: params.get('overlap'),
+          payloadBytes,
+          attemptsUsed,
+          upstreamStatus: upstream.status,
+          upstreamRoundTripMs,
+          reportedModelMs: elapsedMs,
+          image: data.image || { width: 0, height: 0 },
+          predictionCount: predictions.length,
+          confidences,
+        })
       );
 
       return res.json({
@@ -343,7 +431,7 @@ async function startServer() {
         inferenceMs: elapsedMs,
         modelId: data.resolved_model?.model_id || modelId,
         image: data.image || { width: 0, height: 0 },
-        predictions: Array.isArray(data.predictions) ? data.predictions : [],
+        predictions,
       });
     } catch (err: any) {
       return res.status(502).json({

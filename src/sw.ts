@@ -61,7 +61,7 @@ interface SWGlobalScope {
 
 const sw = self as unknown as SWGlobalScope;
 
-const RUNTIME_CACHE = 'roadwatch-runtime-v1';
+const RUNTIME_CACHE = 'roadwatch-runtime-v3';
 const GEOCODE_CACHE = 'roadwatch-geocode-v1';
 
 // Precache production build assets injected by vite-plugin-pwa
@@ -76,7 +76,21 @@ sw.addEventListener('install', (event) => {
 });
 
 sw.addEventListener('activate', (event) => {
-  event.waitUntil(sw.clients.claim());
+  event.waitUntil(
+    Promise.all([
+      sw.clients.claim(),
+      caches.keys().then((keys) =>
+        Promise.all(
+          keys
+            .filter(
+              (key) =>
+                key.startsWith('roadwatch-runtime-') && key !== RUNTIME_CACHE
+            )
+            .map((key) => caches.delete(key))
+        )
+      ),
+    ])
+  );
 });
 
 let activeSyncPromise: Promise<{

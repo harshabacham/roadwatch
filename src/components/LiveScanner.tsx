@@ -183,11 +183,12 @@ export function LiveScanner({
   const [selectedSampleId, setSelectedSampleId] = useState<string>('severe');
   const [uploadedFileUrl, setUploadedFileUrl] = useState<string | null>(null);
   const [uploadedKind, setUploadedKind] = useState<'image' | 'video'>('image');
-  const [uploadedVideoDims, setUploadedVideoDims] = useState<{
+  const [activeMediaDims, setActiveMediaDims] = useState<{
     width: number;
     height: number;
+    fit: 'contain' | 'cover';
   } | null>(null);
-  const [videoOverlayRect, setVideoOverlayRect] = useState<{
+  const [mediaOverlayRect, setMediaOverlayRect] = useState<{
     left: number;
     top: number;
     width: number;
@@ -413,14 +414,53 @@ export function LiveScanner({
     };
   }, []);
 
-  // Align SVG bounding boxes accurately over object-contain uploaded videos (portrait or landscape)
+  // Sync active media dimensions immediately when switching tabs, files, or samples
   useEffect(() => {
-    if (
-      sourceMode !== 'upload' ||
-      uploadedKind !== 'video' ||
-      !uploadedVideoDims
-    ) {
-      setVideoOverlayRect(null);
+    if (sourceMode === 'camera') {
+      const v = videoRef.current;
+      if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+        setActiveMediaDims({ width: v.videoWidth, height: v.videoHeight, fit: 'cover' });
+      } else {
+        setActiveMediaDims(null);
+      }
+      return;
+    }
+    if (sourceMode === 'upload') {
+      if (!uploadedFileUrl) {
+        setActiveMediaDims(null);
+        return;
+      }
+      if (uploadedKind === 'video') {
+        const v = uploadedVideoRef.current;
+        if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+          setActiveMediaDims({ width: v.videoWidth, height: v.videoHeight, fit: 'contain' });
+        } else {
+          setActiveMediaDims(null);
+        }
+      } else {
+        const img = uploadedImgRef.current;
+        if (img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+          setActiveMediaDims({ width: img.naturalWidth, height: img.naturalHeight, fit: 'contain' });
+        } else {
+          setActiveMediaDims(null);
+        }
+      }
+      return;
+    }
+    if (sourceMode === 'samples') {
+      const img = sampleImgRef.current;
+      if (img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+        setActiveMediaDims({ width: img.naturalWidth, height: img.naturalHeight, fit: 'cover' });
+      } else {
+        setActiveMediaDims(null);
+      }
+    }
+  }, [sourceMode, uploadedKind, uploadedFileUrl, selectedSampleId, cameraStatus]);
+
+  // Align SVG bounding boxes pixel-accurately over camera, uploaded videos/photos, and road samples
+  useEffect(() => {
+    if (!activeMediaDims) {
+      setMediaOverlayRect(null);
       return;
     }
     const container = viewfinderRef.current;
@@ -429,12 +469,15 @@ export function LiveScanner({
     const updateRect = () => {
       const cw = container.clientWidth;
       const ch = container.clientHeight;
-      const { width: mw, height: mh } = uploadedVideoDims;
+      const { width: mw, height: mh, fit } = activeMediaDims;
       if (!cw || !ch || !mw || !mh) return;
-      const scale = Math.min(cw / mw, ch / mh);
+      const scale =
+        fit === 'cover'
+          ? Math.max(cw / mw, ch / mh)
+          : Math.min(cw / mw, ch / mh);
       const rw = mw * scale;
       const rh = mh * scale;
-      setVideoOverlayRect({
+      setMediaOverlayRect({
         left: (cw - rw) / 2,
         top: (ch - rh) / 2,
         width: rw,
@@ -450,7 +493,7 @@ export function LiveScanner({
     }
     window.addEventListener('resize', updateRect);
     return () => window.removeEventListener('resize', updateRect);
-  }, [sourceMode, uploadedKind, uploadedVideoDims]);
+  }, [sourceMode, uploadedKind, activeMediaDims]);
 
   async function toggleTorch() {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -1225,7 +1268,7 @@ export function LiveScanner({
     const url = URL.createObjectURL(file);
     setUploadedFileUrl(url);
     setUploadedKind(isVideoFile ? 'video' : 'image');
-    setUploadedVideoDims(null);
+    setActiveMediaDims(null);
     setVideoFramesScanned(0);
     setVideoStreamStats(null);
     sessionCapturedRef.current = [];
@@ -1346,6 +1389,26 @@ export function LiveScanner({
                   autoPlay
                   playsInline
                   muted
+                  onLoadedMetadata={(e) => {
+                    const v = e.currentTarget;
+                    if (v.videoWidth > 0 && v.videoHeight > 0) {
+                      setActiveMediaDims({
+                        width: v.videoWidth,
+                        height: v.videoHeight,
+                        fit: 'cover',
+                      });
+                    }
+                  }}
+                  onResize={(e) => {
+                    const v = e.currentTarget;
+                    if (v.videoWidth > 0 && v.videoHeight > 0) {
+                      setActiveMediaDims({
+                        width: v.videoWidth,
+                        height: v.videoHeight,
+                        fit: 'cover',
+                      });
+                    }
+                  }}
                   className={`w-full h-full object-cover ${
                     cameraStatus === 'ready' ? 'opacity-100' : 'opacity-0'
                   }`}
@@ -1424,9 +1487,10 @@ export function LiveScanner({
                       onLoadedMetadata={(e) => {
                         const v = e.currentTarget;
                         if (v.videoWidth > 0 && v.videoHeight > 0) {
-                          setUploadedVideoDims({
+                          setActiveMediaDims({
                             width: v.videoWidth,
                             height: v.videoHeight,
+                            fit: 'contain',
                           });
                         }
                       }}
@@ -1446,7 +1510,17 @@ export function LiveScanner({
                       src={uploadedFileUrl}
                       alt="Uploaded road inspection photo"
                       referrerPolicy="no-referrer"
-                      className="w-full h-full object-cover"
+                      onLoad={(e) => {
+                        const img = e.currentTarget;
+                        if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                          setActiveMediaDims({
+                            width: img.naturalWidth,
+                            height: img.naturalHeight,
+                            fit: 'contain',
+                          });
+                        }
+                      }}
+                      className="w-full h-full object-contain bg-black"
                     />
                   )
                 ) : (
@@ -1475,20 +1549,30 @@ export function LiveScanner({
                 src={activeSample.url}
                 alt={activeSample.label}
                 referrerPolicy="no-referrer"
+                onLoad={(e) => {
+                  const img = e.currentTarget;
+                  if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                    setActiveMediaDims({
+                      width: img.naturalWidth,
+                      height: img.naturalHeight,
+                      fit: 'cover',
+                    });
+                  }
+                }}
                 className="w-full h-full object-cover"
               />
             )}
 
-            {/* Pixel-level Road Surface & Bounding Box Overlay (aligned to media rect for videos) */}
+            {/* Pixel-level Road Surface & Bounding Box Overlay (aligned exactly to displayed media rect) */}
             <div
               className="absolute pointer-events-none"
               style={
-                videoOverlayRect
+                mediaOverlayRect
                   ? {
-                      left: `${videoOverlayRect.left}px`,
-                      top: `${videoOverlayRect.top}px`,
-                      width: `${videoOverlayRect.width}px`,
-                      height: `${videoOverlayRect.height}px`,
+                      left: `${mediaOverlayRect.left}px`,
+                      top: `${mediaOverlayRect.top}px`,
+                      width: `${mediaOverlayRect.width}px`,
+                      height: `${mediaOverlayRect.height}px`,
                     }
                   : { inset: 0 }
               }
@@ -2309,14 +2393,14 @@ export function LiveScanner({
                   <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                     {/* Thumbnail + Primary Details */}
                     <div className="flex flex-col sm:flex-row sm:items-start gap-4 flex-1 min-w-0">
-                      <div className="relative w-full sm:w-36 aspect-[4/3] rounded-xl overflow-hidden bg-slate-900 border border-slate-200 shrink-0">
+                      <div className="relative w-full sm:w-36 aspect-[4/3] rounded-xl overflow-hidden bg-slate-950 border border-slate-200 shrink-0 flex items-center justify-center">
                         {item.snapshotDataUrl && (
-                          <>
+                          <div className="relative max-w-full max-h-full inline-flex items-center justify-center">
                             <img
                               src={item.snapshotDataUrl}
                               alt={item.detection.formalComplaintTitle}
                               referrerPolicy="no-referrer"
-                              className="w-full h-full object-cover"
+                              className="block max-w-full max-h-full object-contain"
                             />
                             <svg
                               viewBox="0 0 1000 1000"
@@ -2333,7 +2417,7 @@ export function LiveScanner({
                                 strokeWidth="14"
                               />
                             </svg>
-                          </>
+                          </div>
                         )}
                       </div>
 
